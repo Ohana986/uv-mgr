@@ -1,0 +1,2 @@
+[console_scripts]
+uv-mgr = uv_mgr.cli:main

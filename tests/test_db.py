@@ -1,0 +1,263 @@
+"""数据库层测试 — 情景 #1~21。"""
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from uv_mgr.db import (
+    get_connection,
+    init_db,
+    SCHEMA_VERSION,
+    DB_DIR,
+    DB_PATH,
+    add_venv,
+    remove_venv,
+    list_venvs,
+    get_venv_by_path,
+    ensure_package,
+    replace_venv_packages,
+    get_venv_packages,
+    get_orphan_packages,
+    remove_orphan_packages,
+    get_stats,
+)
+
+
+# ── #1 初始化空库 ──────────────────────────────────────────────────
+
+class TestInitDb:
+    def test_tables_exist(self, conn):
+        """初始化后应包含所有表和 _meta。"""
+        meta = conn.execute(
+            "SELECT value FROM _meta WHERE key='schema_version'"
+        ).fetchone()
+        assert meta is not None
+        assert meta["value"] == str(SCHEMA_VERSION)
+
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "venvs" in tables
+        assert "packages" in tables
+        assert "venv_packages" in tables
+        assert "_meta" in tables
+
+    # ── #2 重复初始化 ──────────────────────────────────────────
+
+    def test_reinit_is_idempotent(self, conn):
+        """重复 init_db 不报错，数据不丢失。"""
+        add_venv(conn, "/tmp/my-venv")
+        init_db(conn)
+        venvs = list_venvs(conn)
+        assert len(venvs) == 1
+
+
+# ── #3~9 Venv CRUD ────────────────────────────────────────────────
+
+class TestVenvCrud:
+    def test_add_venv_returns_id(self, conn):
+        """#3 注册 venv 返回自增 ID。"""
+        vid = add_venv(conn, "/tmp/test-venv")
+        assert isinstance(vid, int)
+        assert vid > 0
+
+    def test_add_duplicate_path(self, conn):
+        """#4 重复注册同一路径，返回已有 ID，不报错。"""
+        vid1 = add_venv(conn, "/tmp/test-venv")
+        vid2 = add_venv(conn, "/tmp/test-venv")
+        assert vid1 == vid2
+        assert len(list_venvs(conn)) == 1
+
+    def test_get_venv_by_path(self, conn):
+        """#5 add 后 get_venv_by_path 返回正确行。"""
+        vid = add_venv(conn, "/tmp/test-venv")
+        row = get_venv_by_path(conn, "/tmp/test-venv")
+        assert row is not None
+        assert row["id"] == vid
+        assert row["path"] == "/tmp/test-venv"
+        assert row["name"] == "test-venv"
+        assert row["created_at"] is not None
+
+    def test_remove_existing(self, conn):
+        """#6 移除存在的 venv 返回 True，级联删除关联。"""
+        vid = add_venv(conn, "/tmp/test-venv")
+        ensure_package(conn, "foo", "1.0")
+        replace_venv_packages(conn, vid, [1])
+        assert remove_venv(conn, "/tmp/test-venv") is True
+        # venv_packages 应级联清理
+        links = conn.execute(
+            "SELECT COUNT(*) FROM venv_packages WHERE venv_id=?", (vid,)
+        ).fetchone()[0]
+        assert links == 0
+
+    def test_remove_nonexistent(self, conn):
+        """#7 移除不存在的 venv 返回 False。"""
+        assert remove_venv(conn, "/tmp/no-such-venv") is False
+
+    def test_list_venvs_empty(self, conn):
+        """#8 空列表。"""
+        assert list_venvs(conn) == []
+
+    def test_list_venvs_ordered(self, conn):
+        """#9 多个 venv 按 created_at 排序。"""
+        v1 = add_venv(conn, "/tmp/venv-a")
+        v2 = add_venv(conn, "/tmp/venv-b")
+        v3 = add_venv(conn, "/tmp/venv-c")
+        ids = [r["id"] for r in list_venvs(conn)]
+        assert ids == [v1, v2, v3]  # created_at 递增
+
+
+# ── #10~13 Package CRUD ────────────────────────────────────────────
+
+class TestPackageCrud:
+    def test_ensure_new_package(self, conn):
+        """#10 新包 INSERT，返回新 ID。"""
+        pid = ensure_package(conn, "requests", "2.31.0")
+        assert isinstance(pid, int)
+        assert pid > 0
+
+    def test_ensure_existing_package(self, conn):
+        """#11 已存在包返回已有 ID。"""
+        pid1 = ensure_package(conn, "requests", "2.31.0")
+        pid2 = ensure_package(conn, "requests", "2.31.0")
+        assert pid1 == pid2
+
+    def test_package_unique_constraint(self, conn):
+        """同名同版本只存一条。"""
+        ensure_package(conn, "foo", "1.0")
+        ensure_package(conn, "foo", "1.0")
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM packages"
+        ).fetchone()[0]
+        assert rows == 1
+
+    def test_same_name_diff_version(self, conn):
+        """同名不同版本各自独立。"""
+        p1 = ensure_package(conn, "foo", "1.0")
+        p2 = ensure_package(conn, "foo", "2.0")
+        assert p1 != p2
+
+
+class TestReplaceVenvPackages:
+    def test_replace_linked(self, conn):
+        """#12 全量替换—先删后插，更新 last_synced_at。"""
+        v = add_venv(conn, "/tmp/venv")
+        p1 = ensure_package(conn, "a", "1.0")
+        p2 = ensure_package(conn, "b", "2.0")
+        replace_venv_packages(conn, v, [p1, p2])
+
+        rows = get_venv_packages(conn, v)
+        assert len(rows) == 2
+
+        row = get_venv_by_path(conn, "/tmp/venv")
+        assert row["last_synced_at"] is not None
+
+    def test_replace_empty(self, conn):
+        """#13 传入空列表清空关联。"""
+        v = add_venv(conn, "/tmp/venv")
+        p1 = ensure_package(conn, "a", "1.0")
+        replace_venv_packages(conn, v, [p1])
+        replace_venv_packages(conn, v, [])
+        assert get_venv_packages(conn, v) == []
+
+
+# ── #14~21 查询 ─────────────────────────────────────────────────────
+
+class TestQueries:
+    def test_get_venv_packages_ordered(self, conn, sample_venvs, sample_packages):
+        """#14 get_venv_packages 按包名排序。"""
+        from uv_mgr.db import replace_venv_packages
+
+        # 乱序传入以检验 ORDER BY
+        replace_venv_packages(conn, sample_venvs[0], [sample_packages[2], sample_packages[0], sample_packages[1]])
+        pkgs = get_venv_packages(conn, sample_venvs[0])
+        names = [p["name"] for p in pkgs]
+        assert names == sorted(names)  # flask, pytest, requests
+
+    def test_no_orphans_when_linked(self, conn, linked_packages):
+        """#15 所有包都被引用时无孤立包。"""
+        orphans = get_orphan_packages(conn)
+        assert len(orphans) == 0
+
+    def test_orphans_after_venv_removed(self, conn, linked_packages):
+        """#16 删除 venv 后包变为孤立。"""
+        from uv_mgr.db import remove_venv
+        remove_venv(conn, "/tmp/venv-a")
+        orphans = get_orphan_packages(conn)
+        assert len(orphans) == 3
+
+    def test_partial_version_orphan_not_counted(self, conn):
+        """#17 pkgA v1 被引用、v2 未引用 → v2 仍计入孤立（存在未引用的记录就计入）。"""
+        v = add_venv(conn, "/tmp/venv")
+        p1 = ensure_package(conn, "foo", "1.0")
+        _p2 = ensure_package(conn, "foo", "2.0")
+        replace_venv_packages(conn, v, [p1])
+
+        orphans = get_orphan_packages(conn)
+        assert len(orphans) == 1       # 只有 v2 是孤立
+        assert orphans[0]["version"] == "2.0"
+
+    def test_stats_correct(self, conn, linked_packages):
+        """#18 get_stats 计数准确。"""
+        stats = get_stats(conn)
+        assert stats["venvs"] == 2
+        assert stats["packages"] == 3
+        assert stats["venv_package_links"] == 3  # 只关联到 venv-a
+        assert stats["orphans"] == 0
+
+    def test_stats_with_orphans(self, conn, linked_packages):
+        """删除 venv 后孤立计数正确。"""
+        from uv_mgr.db import remove_venv
+        remove_venv(conn, "/tmp/venv-a")
+        stats = get_stats(conn)
+        assert stats["orphans"] == 3
+
+    def test_remove_orphan_packages(self, conn):
+        """#19 批量删除孤立包记录。"""
+        p1 = ensure_package(conn, "del-me", "1.0")
+        p2 = ensure_package(conn, "keep-me", "2.0")
+        # 不关联任何 venv 使两者都是孤立
+        remove_orphan_packages(conn, [p1])
+        rows = conn.execute("SELECT id FROM packages").fetchall()
+        ids = [r["id"] for r in rows]
+        assert p1 not in ids
+        assert p2 in ids
+
+    def test_db_path(self):
+        """#20 数据库路径指向 ~/.local/share/uv-mgr/index.db。"""
+        import uv_mgr.db
+        assert uv_mgr.db.DB_PATH == Path.home() / ".local" / "share" / "uv-mgr" / "index.db"
+        assert uv_mgr.db.DB_DIR == Path.home() / ".local" / "share" / "uv-mgr"
+
+    def test_foreign_key_cascade_on_venv_delete(self, conn):
+        """#21 删除 venv → venv_packages 级联清理。"""
+        from uv_mgr.db import add_venv, ensure_package, replace_venv_packages, remove_venv
+
+        v = add_venv(conn, "/tmp/venv")
+        p = ensure_package(conn, "x", "1.0")
+        replace_venv_packages(conn, v, [p])
+        remove_venv(conn, "/tmp/venv")
+
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM venv_packages"
+        ).fetchone()[0]
+        assert remaining == 0
+        # packages 表不变（只有关联被删除）
+        assert conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0] == 1
+
+    def test_foreign_key_cascade_on_package_delete(self, conn):
+        """#21 删除 package → venv_packages 级联清理。"""
+        from uv_mgr.db import add_venv, ensure_package, replace_venv_packages, remove_orphan_packages
+
+        v = add_venv(conn, "/tmp/venv")
+        p = ensure_package(conn, "x", "1.0")
+        replace_venv_packages(conn, v, [p])
+        remove_orphan_packages(conn, [p])
+
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM venv_packages"
+        ).fetchone()[0]
+        assert remaining == 0
