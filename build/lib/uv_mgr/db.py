@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DB_DIR = Path.home() / ".local" / "share" / "uv-mgr"
 DB_PATH = DB_DIR / "index.db"
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS venvs (
     path            TEXT UNIQUE NOT NULL,
     name            TEXT,
     python_version  TEXT,
+    source          TEXT NOT NULL DEFAULT 'user',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     last_synced_at  TEXT
 );
@@ -60,6 +61,24 @@ CREATE INDEX IF NOT EXISTS idx_venv_packages_package
 """
 
 
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        ALTER TABLE venvs ADD COLUMN source TEXT NOT NULL DEFAULT 'user';
+
+        UPDATE venvs SET source = 'auto'
+        WHERE path LIKE '%/.venv'
+           OR path LIKE '%/.venv/%';
+
+        UPDATE venvs SET source = 'tool'
+        WHERE path LIKE '%/.local/share/uv/tools/%';
+    """)
+    conn.execute(
+        "UPDATE _meta SET value = '2' WHERE key = 'schema_version'"
+    )
+    conn.commit()
+    print("数据库迁移: v1 → v2（venvs 表新增 source 列，已分类现有记录）")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     cur = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'")
@@ -69,18 +88,22 @@ def init_db(conn: sqlite3.Connection) -> None:
             "INSERT INTO _meta (key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
         )
+    else:
+        version = int(row[0])
+        if version < 2:
+            _migrate_v1_to_v2(conn)
     conn.commit()
 
 
 # ── Venv CRUD ───────────────────────────────────────────────────────
 
-def add_venv(conn: sqlite3.Connection, path: str) -> int:
+def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
     now = datetime.now(timezone.utc).isoformat()
     name = os.path.basename(os.path.normpath(path))
     cur = conn.execute(
-        """INSERT OR IGNORE INTO venvs (path, name, created_at)
-           VALUES (?, ?, ?)""",
-        (path, name, now),
+        """INSERT OR IGNORE INTO venvs (path, name, source, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (path, name, source, now),
     )
     conn.commit()
     if cur.lastrowid:
@@ -98,6 +121,12 @@ def remove_venv(conn: sqlite3.Connection, path: str) -> bool:
 def list_venvs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM venvs ORDER BY created_at"
+    ).fetchall()
+
+
+def get_venvs_by_source(conn: sqlite3.Connection, source: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM venvs WHERE source = ? ORDER BY created_at", (source,)
     ).fetchall()
 
 

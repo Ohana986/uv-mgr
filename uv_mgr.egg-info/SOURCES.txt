@@ -15,4 +15,5 @@ uv_mgr.egg-info/PKG-INFO
 uv_mgr.egg-info/SOURCES.txt
 uv_mgr.egg-info/dependency_links.txt
 uv_mgr.egg-info/entry_points.txt
+uv_mgr.egg-info/requires.txt
 uv_mgr.egg-info/top_level.txt

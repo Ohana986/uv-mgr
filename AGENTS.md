@@ -16,7 +16,6 @@
 ## 架构
 
 ```
-/run/media/xr_w/U_Pan/Documents/Projects/auv/
 ├── pyproject.toml          # 项目元数据，entry point: uv_mgr.cli:main
 ├── README.md               # 用户文档
 ├── QWEN.md                 # 本文件：项目 QWEN 配置 + 已知陷阱

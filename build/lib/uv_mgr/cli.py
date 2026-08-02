@@ -13,6 +13,7 @@ from uv_mgr.db import (
     remove_venv,
     list_venvs,
     get_venv_packages,
+    get_venvs_by_source,
     get_orphan_packages,
     get_stats,
 )
@@ -64,6 +65,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # index list
     p_il = idx_sub.add_parser("list", help="查询索引状态")
     p_il.add_argument("--venvs", action="store_true", help="列出已注册 venv")
+    p_il.add_argument("--type", choices=['user', 'auto', 'tool'], default=None,
+                      help="按来源过滤 venv（user/auto/tool）")
     p_il.add_argument("--packages", action="store_true", help="列出所有已索引包")
     p_il.add_argument("--orphans", action="store_true", help="列出孤立包")
 
@@ -113,14 +116,21 @@ def _cmd_remove(args) -> int:
 
 def _cmd_list(args) -> int:
     conn = get_connection()
-    show_all = not (args.venvs or args.packages or args.orphans)
+    show_venvs = args.venvs or (hasattr(args, 'type') and bool(args.type))
+    show_all = not (show_venvs or args.packages or args.orphans)
 
-    if show_all or args.venvs:
-        venvs = list_venvs(conn)
+    if show_all or show_venvs:
+        if hasattr(args, 'type') and args.type:
+            venvs = get_venvs_by_source(conn, args.type)
+        else:
+            venvs = list_venvs(conn)
         print(f"已注册 venv（{len(venvs)} 个）：")
         for v in venvs:
             last = v["last_synced_at"] or "（未同步）"
-            print(f"  {v['path']}  [{last}]")
+            source = v["source"] if v["source"] else "user"
+            tag = f"[{source}] " if source != "user" else ""
+            py_ver = f" (Python {v['python_version']})" if v["python_version"] else ""
+            print(f"  {tag}{v['path']}{py_ver}  [{last}]")
 
     if show_all or args.packages:
         packages = conn.execute(

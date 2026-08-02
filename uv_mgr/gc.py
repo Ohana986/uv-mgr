@@ -31,7 +31,8 @@ def _get_packages_all_versions_orphaned(conn) -> list[dict]:
     return result
 
 
-def gc(dry_run: bool = False, *, auto_sync: bool = True) -> int:
+def gc(dry_run: bool = False, *, auto_sync: bool = True,
+       verbose: bool = False) -> int:
     """GC 入口：找出并清理孤立缓存包。
 
     返回清理的包数量。
@@ -39,8 +40,9 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True) -> int:
     conn = get_connection()
 
     if auto_sync:
-        print("正在同步 venv 状态...")
-        sync_all(conn, auto_discover=True)
+        if verbose:
+            print("正在同步 venv 状态...")
+        sync_all(conn, auto_discover=True, verbose=verbose)
 
     # 找出完全孤立的包
     orphans = _get_packages_all_versions_orphaned(conn)

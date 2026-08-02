@@ -178,9 +178,11 @@ class TestSyncCommand:
         monkeypatch.setattr(os.path, "abspath", lambda p: p)
         with patch("uv_mgr.cli.sync_venv") as mock:
             from uv_mgr.cli import _cmd_sync
-            args = MagicMock(venv_path="/tmp/my-venv", prune=False)
+            args = MagicMock(venv_path="/tmp/my-venv", prune=False, verbose=False)
             _cmd_sync(args)
-        mock.assert_called_once_with(conn, "/tmp/my-venv", auto_register=True, prune=False)
+        mock.assert_called_once_with(
+            conn, "/tmp/my-venv", auto_register=True, prune=False, verbose=False
+        )
 
 
 # ── #60~61 gc ──────────────────────────────────────────────────────
@@ -190,17 +192,17 @@ class TestGcCommand:
         """#60 gc → 执行清理（dry_run=False）。"""
         with patch("uv_mgr.cli.gc") as mock:
             from uv_mgr.cli import _cmd_gc
-            args = MagicMock(dry_run=False)
+            args = MagicMock(dry_run=False, verbose=False)
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=False)
+        mock.assert_called_once_with(dry_run=False, verbose=False)
 
     def test_gc_dry_run(self, monkeypatch):
         """#61 gc --dry-run → 预览模式。"""
         with patch("uv_mgr.cli.gc") as mock:
             from uv_mgr.cli import _cmd_gc
-            args = MagicMock(dry_run=True)
+            args = MagicMock(dry_run=True, verbose=False)
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=True)
+        mock.assert_called_once_with(dry_run=True, verbose=False)
 
 
 # ── #62 db ─────────────────────────────────────────────────────────
@@ -241,6 +243,30 @@ class TestPassthroughRouting:
                         code = main(["pip", "install", "x"])
         assert code == 0
         mock_sync.assert_called_once()
+
+    def test_global_verbose_passthrough(self, monkeypatch):
+        """透传前剥离全局 -v，并传给 sync_all。"""
+        from uv_mgr.cli import main
+        with patch("uv_mgr.cli.get_connection") as mock_conn:
+            with patch("uv_mgr.cli.init_db"):
+                with patch("uv_mgr.cli.run_uv_passthrough", return_value=0):
+                    with patch("uv_mgr.cli.sync_all") as mock_sync:
+                        code = main(["-v", "pip", "install", "x"])
+        assert code == 0
+        mock_sync.assert_called_once_with(
+            mock_conn.return_value, auto_discover=True, verbose=True
+        )
+
+    def test_verbose_flag_sync_cmd(self, conn, capsys, monkeypatch):
+        """index sync --verbose 传递 verbose 给 sync_all。"""
+        monkeypatch.setattr("uv_mgr.cli.get_connection", lambda: conn)
+        with patch("uv_mgr.cli.sync_all") as mock:
+            from uv_mgr.cli import _cmd_sync
+            args = MagicMock(venv_path=None, prune=False, verbose=True)
+            _cmd_sync(args)
+        mock.assert_called_once_with(
+            conn, auto_discover=True, prune=False, verbose=True
+        )
 
     def test_no_sync_after_failure(self, monkeypatch):
         """#65 透传 uv 失败 (非 0) → 跳过 sync。"""

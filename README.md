@@ -75,7 +75,13 @@ uv-mgr index sync
 
 # 同步后自动清理已删除的 venv 记录
 uv-mgr index sync --prune
+
+# 显示每个 venv 的同步详情（默认静默）
+uv-mgr index sync --verbose
 ```
+
+> 同步成功的"已同步"详情默认隐藏。需要查看时加 `-v` / `--verbose`：
+> `uv-mgr -v <uv 命令>`（透传 uv 后）或 `uv-mgr index sync -v`、`uv-mgr index gc -v`。
 
 **垃圾回收**
 

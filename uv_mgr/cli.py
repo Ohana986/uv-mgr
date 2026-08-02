@@ -47,6 +47,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version", action="version", version=f"uv-mgr {__version__}"
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="显示每个 venv 的同步详情（默认隐藏）",
+    )
     # 子命令
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
@@ -75,10 +79,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_is.add_argument("venv_path", nargs="?", default=None, help="指定 venv 路径（默认全部）")
     p_is.add_argument("--prune", action="store_true",
                       help="同步时自动清理已不存在的 venv 记录")
+    p_is.add_argument("-v", "--verbose", action="store_true",
+                      help="显示每个 venv 的同步详情（默认隐藏）")
 
     # index gc
     p_ig = idx_sub.add_parser("gc", help="清理孤立缓存包")
     p_ig.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
+    p_ig.add_argument("-v", "--verbose", action="store_true",
+                      help="显示每个 venv 的同步详情（默认隐藏）")
 
     # db
     p_db = sub.add_parser("db", help="数据库管理")
@@ -129,7 +137,8 @@ def _cmd_list(args) -> int:
             last = v["last_synced_at"] or "（未同步）"
             source = v["source"] if v["source"] else "user"
             tag = f"[{source}] " if source != "user" else ""
-            print(f"  {tag}{v['path']}  [{last}]")
+            py_ver = f" (Python {v['python_version']})" if v["python_version"] else ""
+            print(f"  {tag}{v['path']}{py_ver}  [{last}]")
 
     if show_all or args.packages:
         packages = conn.execute(
@@ -156,15 +165,16 @@ def _cmd_sync(args) -> int:
     conn = get_connection()
     if args.venv_path:
         sync_venv(conn, os.path.abspath(args.venv_path),
-                  auto_register=True, prune=args.prune)
+                  auto_register=True, prune=args.prune, verbose=args.verbose)
     else:
-        sync_all(conn, auto_discover=True, prune=args.prune)
+        sync_all(conn, auto_discover=True, prune=args.prune,
+                 verbose=args.verbose)
     conn.close()
     return 0
 
 
 def _cmd_gc(args) -> int:
-    return gc(dry_run=args.dry_run)
+    return gc(dry_run=args.dry_run, verbose=args.verbose)
 
 
 def _cmd_db(args) -> int:
@@ -194,10 +204,23 @@ def main(argv: list[str] | None = None) -> int:
         _build_parser().print_help()
         return 0
 
+    # 全局 --verbose（用于 uv 透传场景，如 uv-mgr -v pip install）
+    verbose = False
+    if argv[0] in ("--verbose", "-v"):
+        verbose = True
+        argv = argv[1:]
+
+    if not argv:
+        _build_parser().print_help()
+        return 0
+
     # 检查是否为 uv-mgr 自有命令
     if argv[0] in OWN_COMMANDS:
         parser = _build_parser()
         parsed = parser.parse_args(argv)
+        # 全局 -v 优先于子命令默认值
+        if verbose:
+            parsed.verbose = True
         match parsed.command:
             case "index":
                 match parsed.index_command:
@@ -229,8 +252,9 @@ def main(argv: list[str] | None = None) -> int:
         # 透传给 uv
         code = run_uv_passthrough(argv)
         if code == 0 and should_sync_after_uv(argv):
-            print("\n正在同步 venv 状态...")
+            if verbose:
+                print("\n正在同步 venv 状态...")
             conn = get_connection()
-            sync_all(conn, auto_discover=True)
+            sync_all(conn, auto_discover=True, verbose=verbose)
             conn.close()
         return code

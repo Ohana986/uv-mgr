@@ -78,7 +78,7 @@ def scan_venv_packages(venv_python: str) -> list[tuple[str, str]]:
 
 def sync_venv(conn, venv_path: str, *,
               auto_register: bool = False, prune: bool = False,
-              source: str = 'auto') -> None:
+              source: str = 'auto', verbose: bool = False) -> None:
     """同步单个 venv 的包状态到数据库。"""
     venv = get_venv_by_path(conn, venv_path)
 
@@ -109,13 +109,33 @@ def sync_venv(conn, venv_path: str, *,
         print(f"警告: 未找到 Python 解释器: {python_path}", file=sys.stderr)
         return
 
+    # 获取并记录 Python 版本
+    python_version = None
+    try:
+        ver_res = subprocess.run(
+            [str(python_path), "--version"],
+            capture_output=True, text=True, timeout=10
+        )
+        if ver_res.returncode == 0:
+            # Output is like "Python 3.11.15" or on stderr
+            out = ver_res.stdout.strip() or ver_res.stderr.strip()
+            if out.startswith("Python "):
+                python_version = out.split()[1]
+    except Exception:
+        pass
+
     # 扫描已安装包
     packages = scan_venv_packages(str(python_path))
     if not packages:
-        print(f"信息: {venv_path} 中没有已安装的包")
-        # 仍然清空记录并更新同步时间
+        if verbose:
+            print(f"信息: {venv_path} 中没有已安装的包")
+        # 仍然清空记录并更新同步时间和 python_version
         replace_venv_packages(conn, venv["id"], [])
-        print(f"已同步: {venv_path}（0 个包）")
+        if python_version:
+            conn.execute("UPDATE venvs SET python_version = ? WHERE id = ?", (python_version, venv["id"]))
+            conn.commit()
+        if verbose:
+            print(f"已同步: {venv_path}（0 个包）")
         return
 
     # 确保所有包在 packages 表中存在，获取 ID
@@ -123,10 +143,15 @@ def sync_venv(conn, venv_path: str, *,
 
     # 全量替换关联
     replace_venv_packages(conn, venv["id"], pkg_ids)
-    print(f"已同步: {venv_path}（{len(packages)} 个包）")
+    if python_version:
+        conn.execute("UPDATE venvs SET python_version = ? WHERE id = ?", (python_version, venv["id"]))
+        conn.commit()
+    if verbose:
+        print(f"已同步: {venv_path}（{len(packages)} 个包）")
 
 
-def sync_all(conn, *, auto_discover: bool = True, prune: bool = False) -> None:
+def sync_all(conn, *, auto_discover: bool = True, prune: bool = False,
+             verbose: bool = False) -> None:
     """同步所有已注册 venv，并可选自动发现新 venv 及 uv tool。"""
     venvs = list_venvs(conn)
     if not venvs and not auto_discover:
@@ -168,7 +193,8 @@ def sync_all(conn, *, auto_discover: bool = True, prune: bool = False) -> None:
 
     # 逐个同步（包括 tool venv）
     for v in list_venvs(conn):
-        sync_venv(conn, v["path"], auto_register=False, prune=prune)
+        sync_venv(conn, v["path"], auto_register=False, prune=prune,
+                  verbose=verbose)
 
 
 def run_uv_passthrough(args: list[str]) -> int:

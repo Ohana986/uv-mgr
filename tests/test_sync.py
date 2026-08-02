@@ -110,12 +110,22 @@ class TestSyncVenv:
         monkeypatch.setattr(Path, "exists", lambda self: True)
         monkeypatch.setattr(os.path, "isdir", lambda p: True)
 
-        # mock 返回空包列表
-        sync_venv(conn, "/tmp/test-venv")
+        # Mock subprocess.run for python version check to succeed
+        original_run = subprocess.run
+        def mock_run(cmd, *args, **kwargs):
+            if len(cmd) > 1 and cmd[1] == "--version":
+                mock = MagicMock(returncode=0, stdout="Python 3.11.15", stderr="")
+                return mock
+            return mock_uv_run_success(cmd, *args, **kwargs)
 
-        from uv_mgr.db import get_venv_packages
+        with patch("subprocess.run", side_effect=mock_run):
+            sync_venv(conn, "/tmp/test-venv")
+
+        from uv_mgr.db import get_venv_packages, get_venv_by_path
         pkgs = get_venv_packages(conn, add_venv(conn, "/tmp/test-venv"))
         assert pkgs == []
+        v = get_venv_by_path(conn, "/tmp/test-venv")
+        assert v["python_version"] == "3.11.15"
 
     def test_auto_register(self, conn, monkeypatch, mock_uv_run_success):
         """#33 未注册 + auto_register=True → 自动注册。"""
@@ -155,6 +165,70 @@ class TestSyncVenv:
         sync_venv(conn, "/tmp/no-python")
         captured = capsys.readouterr()
         assert "Python 解释器" in captured.err
+
+
+# ── #88~90 verbose 参数 ────────────────────────────────────────────
+
+class TestSyncVerbose:
+    def test_sync_quiet_by_default(self, conn, monkeypatch, capsys,
+                                   mock_uv_run_success):
+        """#88 默认不打印"已同步"详情。"""
+        from uv_mgr.db import add_venv
+
+        add_venv(conn, "/tmp/quiet-venv")
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if len(cmd) > 1 and cmd[1] == "--version":
+                return MagicMock(returncode=0, stdout="Python 3.11.15", stderr="")
+            return mock_uv_run_success(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            sync_venv(conn, "/tmp/quiet-venv")
+
+        captured = capsys.readouterr()
+        assert "已同步" not in captured.out
+
+    def test_sync_verbose_shows_details(self, conn, monkeypatch, capsys,
+                                        mock_uv_run_success):
+        """#89 verbose=True 时打印"已同步"详情。"""
+        from uv_mgr.db import add_venv
+
+        add_venv(conn, "/tmp/verbose-venv")
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if len(cmd) > 1 and cmd[1] == "--version":
+                return MagicMock(returncode=0, stdout="Python 3.11.15", stderr="")
+            return mock_uv_run_success(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            sync_venv(conn, "/tmp/verbose-venv", verbose=True)
+
+        captured = capsys.readouterr()
+        assert "已同步" in captured.out
+
+    def test_sync_all_verbose_forwarded(self, conn, monkeypatch, capsys,
+                                        mock_uv_run_success):
+        """#90 sync_all verbose 传递到 sync_venv。"""
+        from uv_mgr.db import add_venv
+
+        add_venv(conn, "/tmp/forward-venv")
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+
+        def mock_run(cmd, *args, **kwargs):
+            if len(cmd) > 1 and cmd[1] == "--version":
+                return MagicMock(returncode=0, stdout="Python 3.11.15", stderr="")
+            return mock_uv_run_success(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=mock_run):
+            sync_all(conn, auto_discover=False, verbose=True)
+
+        captured = capsys.readouterr()
+        assert "已同步: /tmp/forward-venv" in captured.out
 
 
 # ── #38~42 sync_all ────────────────────────────────────────────────

@@ -16,3 +16,4 @@ Classifier: Programming Language :: Python :: 3.12
 Classifier: Programming Language :: Python :: 3.13
 Classifier: Topic :: System :: Archiving :: Packaging
 Requires-Python: >=3.10
+Requires-Dist: pytest>=9.1.1
