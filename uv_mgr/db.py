@@ -100,14 +100,12 @@ def init_db(conn: sqlite3.Connection) -> None:
 def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
     now = datetime.now(timezone.utc).isoformat()
     name = os.path.basename(os.path.normpath(path))
-    cur = conn.execute(
+    conn.execute(
         """INSERT OR IGNORE INTO venvs (path, name, source, created_at)
            VALUES (?, ?, ?, ?)""",
         (path, name, source, now),
     )
     conn.commit()
-    if cur.lastrowid:
-        return cur.lastrowid
     row = conn.execute("SELECT id FROM venvs WHERE path = ?", (path,)).fetchone()
     return row["id"]
 
@@ -139,12 +137,10 @@ def get_venv_by_path(conn: sqlite3.Connection, path: str):
 # ── Package CRUD ────────────────────────────────────────────────────
 
 def ensure_package(conn: sqlite3.Connection, name: str, version: str) -> int:
-    cur = conn.execute(
+    conn.execute(
         """INSERT OR IGNORE INTO packages (name, version) VALUES (?, ?)""",
         (name, version),
     )
-    if cur.rowcount > 0:
-        return cur.lastrowid
     row = conn.execute(
         "SELECT id FROM packages WHERE name = ? AND version = ?",
         (name, version),

@@ -1,0 +1,27 @@
+# Python 字节码与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.pytest-tmp/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# 编辑器与操作系统
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
