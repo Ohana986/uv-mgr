@@ -95,7 +95,7 @@ class TestInitDb:
         assert {"operations", "sync_snapshots", "snapshot_packages", "package_events"} <= tables
         assert conn.execute(
             "SELECT value FROM _meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "4"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
 
 
 # ── #3~9 Venv CRUD ────────────────────────────────────────────────

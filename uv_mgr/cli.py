@@ -92,6 +92,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # index gc
     p_ig = idx_sub.add_parser("gc", help="清理完全孤立包名对应的缓存")
     p_ig.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
+    p_ig.add_argument("--rebuild", action="store_true",
+                      help="清理有旧版本记录的包，并重建仍在使用的版本缓存")
     p_ig.add_argument("-v", "--verbose", action="store_true",
                       help="显示每个 venv 的同步详情（默认隐藏）")
 
@@ -208,7 +210,8 @@ def _cmd_sync(args) -> int:
 
 
 def _cmd_gc(args) -> int:
-    return gc(dry_run=args.dry_run, verbose=args.verbose)
+    return gc(dry_run=args.dry_run, verbose=args.verbose,
+              rebuild=getattr(args, "rebuild", False))
 
 
 def _cmd_db(args) -> int:

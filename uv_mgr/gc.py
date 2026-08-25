@@ -2,12 +2,19 @@
 
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 from uv_mgr.db import (
     get_connection,
     get_orphan_packages,
     remove_orphan_packages,
     record_operation,
+    get_rebuild_candidates,
+    record_rebuild_failure,
+    clear_rebuild_failure,
+    record_rebuild_success,
+    prune_rebuild_failures,
 )
 from uv_mgr.sync import check_uv_version, sync_all
 
@@ -33,8 +40,58 @@ def _get_packages_all_versions_orphaned(conn) -> list[dict]:
     return result
 
 
+def _run_rebuild(conn, name: str, versions: list[str]) -> bool:
+    """清空一个包名的缓存，并用临时项目恢复仍在使用的版本。"""
+    try:
+        cleaned = subprocess.run(
+            ["uv", "cache", "clean", name], capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        error = "清理缓存超时" if isinstance(exc, subprocess.TimeoutExpired) else "找不到 uv 命令"
+        for version in versions:
+            record_rebuild_failure(conn, name, version, error)
+        print(f"重建失败: {error}")
+        return False
+    if cleaned.returncode != 0:
+        error = cleaned.stderr.strip() or "uv cache clean 执行失败"
+        for version in versions:
+            record_rebuild_failure(conn, name, version, error)
+        print(f"重建失败: {error}")
+        return False
+
+    all_success = True
+    with tempfile.TemporaryDirectory(prefix="uv-mgr-rebuild-", dir="/tmp") as temp_dir:
+        for version in versions:
+            project_dir = Path(temp_dir) / f"project-{version.replace('/', '_')}"
+            requirement = f"{name}=={version}"
+            try:
+                result = subprocess.run(
+                    ["uv", "init", "--bare", "--vcs", "none", "--no-readme", str(project_dir)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode == 0:
+                    result = subprocess.run(
+                        ["uv", "add", requirement], cwd=project_dir,
+                        capture_output=True, text=True, timeout=300,
+                    )
+                if result.returncode == 0:
+                    clear_rebuild_failure(conn, name, version)
+                    record_rebuild_success(conn, name, version)
+                    print(f"  已重建: {requirement}")
+                    continue
+                error = result.stderr.strip() or "uv add 执行失败"
+            except subprocess.TimeoutExpired:
+                error = "重建超时"
+            except FileNotFoundError:
+                error = "找不到 uv 命令"
+            record_rebuild_failure(conn, name, version, error)
+            print(f"  重建失败: {requirement}: {error}")
+            all_success = False
+    return all_success
+
+
 def gc(dry_run: bool = False, *, auto_sync: bool = True,
-       verbose: bool = False) -> int:
+       verbose: bool = False, rebuild: bool = False) -> int:
     """GC 入口：找出并清理孤立缓存包。
 
     返回清理的包数量。
@@ -56,10 +113,15 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
                 record_operation(conn, "gc", success=False, error=message)
                 return 1
 
+        prune_rebuild_failures(conn)
         # 找出完全孤立的包
         orphans = _get_packages_all_versions_orphaned(conn)
+        rebuild_rows = get_rebuild_candidates(conn) if rebuild else []
+        rebuild_packages: dict[str, list[str]] = {}
+        for row in rebuild_rows:
+            rebuild_packages.setdefault(row["name"], []).append(row["version"])
 
-        if not orphans:
+        if not orphans and not rebuild_packages:
             print("没有需要清理的孤立包。")
             record_operation(conn, "gc_dry_run" if dry_run else "gc",
                              summary="没有需要清理的完全孤立包")
@@ -71,9 +133,15 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
         for o in orphans:
             versions = ", ".join(o["versions"])
             print(f"  {o['name']} [{versions}]")
+        if rebuild_packages:
+            print(f"发现 {len(rebuild_packages)} 个有旧版本记录的在用包，将清理并重建：")
+            for name, versions in rebuild_packages.items():
+                print(f"  {name} [{', '.join(versions)}]")
 
         if dry_run:
-            print(f"\n[dry-run] 将清理 {len(orphans)} 个包，共 {total_versions} 个版本")
+            print(f"\n[dry-run] 将清理 {len(orphans)} 个完全孤立包，共 {total_versions} 个版本")
+            if rebuild_packages:
+                print(f"[dry-run] 将重建 {len(rebuild_packages)} 个包的 {len(rebuild_rows)} 个在用版本")
             print("[dry-run] 未执行实际清理。运行 uv-mgr index gc（不带 --dry-run）以执行。")
             record_operation(
                 conn, "gc_dry_run",
@@ -105,6 +173,12 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
                 failed_count += 1
                 print("错误: 找不到 uv 命令")
 
+        rebuild_failed = 0
+        for name, versions in rebuild_packages.items():
+            print(f"正在清理并重建: {name}...", flush=True)
+            if not _run_rebuild(conn, name, versions):
+                rebuild_failed += 1
+
         # 从 DB 删除成功清理的包记录
         if cleaned_names:
             placeholders = ",".join("?" for _ in cleaned_names)
@@ -122,11 +196,12 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
                 remove_orphan_packages(conn, orphan_ids)
 
         print(f"\n已清理 {len(cleaned_names)}/{len(orphans)} 个孤立包。")
-        success = failed_count == 0
+        success = failed_count == 0 and rebuild_failed == 0
         record_operation(
             conn, "gc", success=success,
-            summary=f"已清理 {len(cleaned_names)}/{len(orphans)} 个完全孤立包",
-            error=None if success else f"{failed_count} 个包清理失败",
+            summary=(f"已清理 {len(cleaned_names)}/{len(orphans)} 个完全孤立包；"
+                     f"重建 {len(rebuild_packages) - rebuild_failed}/{len(rebuild_packages)} 个在用包"),
+            error=None if success else f"{failed_count} 个孤立包清理失败，{rebuild_failed} 个包重建失败",
         )
         return 0 if success else 1
     finally:

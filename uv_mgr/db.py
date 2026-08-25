@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 DB_DIR = Path.home() / ".local" / "share" / "uv-mgr"
 DB_PATH = DB_DIR / "index.db"
@@ -102,6 +102,22 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_venv_time
     ON sync_snapshots(venv_path, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_package_events_name_time
     ON package_events(name, occurred_at DESC);
+
+CREATE TABLE IF NOT EXISTS cache_rebuild_failures (
+    name         TEXT NOT NULL,
+    version      TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 1,
+    last_error   TEXT NOT NULL,
+    last_failed_at TEXT NOT NULL,
+    PRIMARY KEY (name, version)
+);
+
+CREATE TABLE IF NOT EXISTS cache_rebuild_successes (
+    name         TEXT NOT NULL,
+    version      TEXT NOT NULL,
+    rebuilt_at   TEXT NOT NULL,
+    PRIMARY KEY (name, version)
+);
 """
 
 
@@ -173,6 +189,34 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     print("数据库迁移: v3 → v4（已启用操作审计与包版本历史）")
 
 
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """保存按包名重建缓存时的可重试失败项。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS cache_rebuild_failures (
+        name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        last_error TEXT NOT NULL,
+        last_failed_at TEXT NOT NULL,
+        PRIMARY KEY (name, version)
+    )""")
+    conn.execute("UPDATE _meta SET value = '5' WHERE key = 'schema_version'")
+    conn.commit()
+    print("数据库迁移: v4 → v5（已启用缓存重建失败重试）")
+
+
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """保存已成功重建的版本，避免重复清理同一缓存。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS cache_rebuild_successes (
+        name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        rebuilt_at TEXT NOT NULL,
+        PRIMARY KEY (name, version)
+    )""")
+    conn.execute("UPDATE _meta SET value = '6' WHERE key = 'schema_version'")
+    conn.commit()
+    print("数据库迁移: v5 → v6（已启用缓存重建完成记录）")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     cur = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'")
@@ -192,6 +236,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             version = 3
         if version < 4:
             _migrate_v3_to_v4(conn)
+            version = 4
+        if version < 5:
+            _migrate_v4_to_v5(conn)
+            version = 5
+        if version < 6:
+            _migrate_v5_to_v6(conn)
         elif version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"数据库 schema 版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}，"
@@ -507,6 +557,103 @@ def remove_orphan_packages(conn: sqlite3.Connection, ids: list[int]) -> None:
     placeholders = ",".join("?" for _ in ids)
     conn.execute(
         f"DELETE FROM packages WHERE id IN ({placeholders})", ids
+    )
+    conn.commit()
+
+
+def get_rebuild_candidates(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """返回曾有旧版本、当前仍被 venv 引用的包版本，以及失败重试项。"""
+    return conn.execute(
+        """WITH current_packages AS (
+               SELECT DISTINCT p.name, p.version
+               FROM packages p JOIN venv_packages vp ON vp.package_id = p.id
+           ), historical_names AS (
+               SELECT DISTINCT current.name
+               FROM current_packages current
+               JOIN snapshot_packages old ON old.name = current.name
+               WHERE old.version != current.version
+           ), retry_names AS (
+               SELECT DISTINCT f.name
+               FROM cache_rebuild_failures f
+               JOIN current_packages current
+                 ON current.name = f.name AND current.version = f.version
+           )
+           SELECT name, version FROM (
+               SELECT current.name AS name, current.version AS version
+               FROM current_packages current JOIN historical_names h ON h.name = current.name
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM cache_rebuild_successes success
+                   WHERE success.name = current.name AND success.version = current.version
+               ) OR EXISTS (
+                   SELECT 1
+                   FROM cache_rebuild_successes success
+                   JOIN sync_snapshots newer
+                     ON newer.occurred_at > success.rebuilt_at
+                   JOIN snapshot_packages changed
+                     ON changed.snapshot_id = newer.id
+                    AND changed.name = current.name
+                   WHERE success.name = current.name
+                     AND success.version = current.version
+                     AND changed.version != current.version
+               )
+               UNION
+               SELECT current.name AS name, current.version AS version
+               FROM current_packages current
+               JOIN retry_names retry ON retry.name = current.name
+           )
+           ORDER BY name, version"""
+    ).fetchall()
+
+
+def record_rebuild_failure(conn: sqlite3.Connection, name: str, version: str,
+                           error: str) -> None:
+    conn.execute(
+        """INSERT INTO cache_rebuild_failures
+           (name, version, attempts, last_error, last_failed_at)
+           VALUES (?, ?, 1, ?, ?)
+           ON CONFLICT(name, version) DO UPDATE SET
+             attempts = attempts + 1,
+             last_error = excluded.last_error,
+             last_failed_at = excluded.last_failed_at""",
+        (normalize_package_name(name), version, error, _now()),
+    )
+    conn.commit()
+
+
+def clear_rebuild_failure(conn: sqlite3.Connection, name: str, version: str) -> None:
+    conn.execute(
+        "DELETE FROM cache_rebuild_failures WHERE name = ? AND version = ?",
+        (normalize_package_name(name), version),
+    )
+    conn.commit()
+
+
+def record_rebuild_success(conn: sqlite3.Connection, name: str, version: str) -> None:
+    normalized_name = normalize_package_name(name)
+    conn.execute(
+        """INSERT INTO cache_rebuild_successes (name, version, rebuilt_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(name, version) DO UPDATE SET rebuilt_at = excluded.rebuilt_at""",
+        (normalized_name, version, _now()),
+    )
+    conn.commit()
+
+
+def prune_rebuild_failures(conn: sqlite3.Connection) -> None:
+    """删除已不再被当前任何 venv 使用的缓存重建状态记录。"""
+    conn.execute(
+        """DELETE FROM cache_rebuild_failures AS failure
+           WHERE NOT EXISTS (
+               SELECT 1 FROM packages p JOIN venv_packages vp ON vp.package_id = p.id
+               WHERE p.name = failure.name AND p.version = failure.version
+           )"""
+    )
+    conn.execute(
+        """DELETE FROM cache_rebuild_successes AS success
+           WHERE NOT EXISTS (
+               SELECT 1 FROM packages p JOIN venv_packages vp ON vp.package_id = p.id
+               WHERE p.name = success.name AND p.version = success.version
+           )"""
     )
     conn.commit()
 

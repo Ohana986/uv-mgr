@@ -200,17 +200,26 @@ class TestGcCommand:
         """#60 gc → 执行清理（dry_run=False）。"""
         with patch("uv_mgr.cli.gc") as mock:
             from uv_mgr.cli import _cmd_gc
-            args = MagicMock(dry_run=False, verbose=False)
+            args = MagicMock(dry_run=False, verbose=False, rebuild=False)
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=False, verbose=False)
+        mock.assert_called_once_with(dry_run=False, verbose=False, rebuild=False)
 
     def test_gc_dry_run(self, monkeypatch):
         """#61 gc --dry-run → 预览模式。"""
         with patch("uv_mgr.cli.gc") as mock:
             from uv_mgr.cli import _cmd_gc
-            args = MagicMock(dry_run=True, verbose=False)
+            args = MagicMock(dry_run=True, verbose=False, rebuild=False)
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=True, verbose=False)
+        mock.assert_called_once_with(dry_run=True, verbose=False, rebuild=False)
+
+    def test_gc_rebuild(self, monkeypatch):
+        """gc --rebuild → 启用按当前版本重建缓存。"""
+        from uv_mgr.cli import _build_parser, _cmd_gc
+
+        with patch("uv_mgr.cli.gc") as mock:
+            args = _build_parser().parse_args(["index", "gc", "--rebuild"])
+            _cmd_gc(args)
+        mock.assert_called_once_with(dry_run=False, verbose=False, rebuild=True)
 
 
 # ── #62 db ─────────────────────────────────────────────────────────
