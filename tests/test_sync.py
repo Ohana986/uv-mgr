@@ -47,6 +47,20 @@ class TestShouldSyncAfterUv:
         assert should_sync_after_uv([]) is False
 
 
+class TestUvVersion:
+    @patch("subprocess.run")
+    def test_supported(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.4.7", stderr="")
+        from uv_mgr.sync import check_uv_version
+        assert check_uv_version()[0] is True
+
+    @patch("subprocess.run")
+    def test_too_old(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.3.9", stderr="")
+        from uv_mgr.sync import check_uv_version
+        assert check_uv_version()[0] is False
+
+
 # ── #27~31 scan_venv_packages ──────────────────────────────────────
 
 class TestScanVenvPackages:
@@ -61,42 +75,47 @@ class TestScanVenvPackages:
             ]),
             stderr="",
         )
-        result = scan_venv_packages("/tmp/venv/bin/python")
-        assert result == [("pip", "26.1.2"), ("requests", "2.31.0")]
-        mock_run.assert_called_once()
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            result = scan_venv_packages("/tmp/venv/bin/python")
+        assert result == ([("pip", "26.1.2"), ("requests", "2.31.0")], True)
 
     @patch("subprocess.run")
     def test_empty_venv(self, mock_run):
         """#28 空 venv 返回空列表。"""
         mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
-        result = scan_venv_packages("/tmp/venv/bin/python")
-        assert result == []
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            result = scan_venv_packages("/tmp/venv/bin/python")
+        assert result == ([], True)
 
     @patch("subprocess.run")
     def test_uv_error(self, mock_run):
         """#29 uv 返回非 0 时返回空列表。"""
         mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
-        result = scan_venv_packages("/tmp/venv/bin/python")
-        assert result == []
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            result = scan_venv_packages("/tmp/venv/bin/python")
+        assert result == ([], False)
 
     @patch("subprocess.run")
     def test_invalid_json(self, mock_run):
         """#30 非法 JSON 返回空列表。"""
         mock_run.return_value = MagicMock(returncode=0, stdout="not json", stderr="")
-        result = scan_venv_packages("/tmp/venv/bin/python")
-        assert result == []
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            result = scan_venv_packages("/tmp/venv/bin/python")
+        assert result == ([], False)
 
     @patch("subprocess.run", side_effect=FileNotFoundError)
     def test_uv_not_found(self, mock_run):
         """#31 uv 不存在返回空列表。"""
-        result = scan_venv_packages("/tmp/venv/bin/python")
-        assert result == []
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            result = scan_venv_packages("/tmp/venv/bin/python")
+        assert result == ([], False)
 
     @patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="uv", timeout=60))
     def test_timeout(self, mock_run):
         """超时返回空列表。"""
-        result = scan_venv_packages("/tmp/venv/bin/python")
-        assert result == []
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            result = scan_venv_packages("/tmp/venv/bin/python")
+        assert result == ([], False)
 
 
 # ── #32~37 sync_venv ───────────────────────────────────────────────
@@ -306,7 +325,8 @@ class TestRunUvPassthrough:
     def test_normal_passthrough(self, mock_run):
         """#43 透传 uv 返回 uv 返回码。"""
         mock_run.return_value = MagicMock(returncode=0)
-        assert run_uv_passthrough(["pip", "list"]) == 0
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            assert run_uv_passthrough(["pip", "list"]) == 0
         mock_run.assert_called_once_with(["uv", "pip", "list"])
 
     @patch("subprocess.run", side_effect=FileNotFoundError)
@@ -320,4 +340,5 @@ class TestRunUvPassthrough:
     @patch("subprocess.run", side_effect=KeyboardInterrupt)
     def test_keyboard_interrupt(self, mock_run):
         """#45 Ctrl+C 中断返回 130。"""
-        assert run_uv_passthrough(["pip", "list"]) == 130
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            assert run_uv_passthrough(["pip", "list"]) == 130

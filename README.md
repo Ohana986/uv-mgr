@@ -4,6 +4,12 @@ uv 包装器：全局索引管理 + 孤立包垃圾回收。
 
 ## 解决的问题
 
+官方定义是：uv cache prune 只删除“未使用的缓存条目”，以及由 uv 集中管理的项目环境；它不会扫描普通虚拟环境的包引用关系，也不会因为你删除了某个 .venv 就判定相应包缓存失效。因此：
+1. 创建 uv-cache-prune-test/.venv，用 uv pip install 安装 httpx。
+2. 删除整个 uv-cache-prune-test。
+3. 执行 uv cache prune。
+第 3 步通常不会移除为 httpx 下载的 wheel、解压归档等缓存。
+
 `uv` 使用硬链接/副本在虚拟环境之间共享包缓存，但没有全局状态追踪。长时间使用后，缓存中会累积大量已不被任何 venv 引用的旧版本包，占用磁盘空间。`uv-mgr` 维护一个索引数据库来跟踪每个 venv 的包状态，并提供 GC 命令安全地清理无用缓存。
 
 ## 安装
@@ -29,14 +35,15 @@ python -m uv_mgr <command>
 ```bash
 # 直接透传 uv 命令，执行后自动同步索引
 uv-mgr sync                 # uv sync：同步项目环境
-uv-mgr add requests         # uv add：添加依赖
-uv-mgr remove requests      # uv remove：删除依赖
+uv-mgr add requests         # 透传 uv add：添加依赖
+uv-mgr remove requests      # 透传 uv remove：删除依赖
 uv-mgr venv --python 3.11   # uv venv：创建虚拟环境（自动注册到索引）
 uv-mgr run app.py           # uv run：运行脚本
 uv-mgr pip list             # uv pip list：查看已安装包
 ```
 
-透传 uv 执行成功后，会自动触发一次 `uv-mgr index sync` 更新索引。
+透传 uv 执行成功后，会自动触发一次 `uv-mgr index sync` 更新索引。`add`、`remove`、`list` 等未出现在
+`index` 后的命令都是 uv 命令透传；索引管理命令必须使用 `uv-mgr index <subcommand>`。
 
 ### 索引管理（`uv-mgr index <subcommand>`）
 
@@ -103,7 +110,7 @@ uv-mgr db info
 
 | 想做的事 | 命令 |
 |----------|------|
-| 安装依赖 | `uv-mgr add requests` |
+| 安装依赖 | `uv-mgr add requests`（透传 uv） |
 | 创建 venv | `uv-mgr venv --python 3.11` |
 | 注册 venv 到索引 | `uv-mgr index add .venv` |
 | 查看索引状态 | `uv-mgr index list` |
@@ -135,3 +142,14 @@ uv-mgr/
 ```
 
 数据库位置：`~/.local/share/uv-mgr/index.db`
+
+## 自动发现与 uv 兼容性
+
+自动发现仅检查当前目录、最近祖先目录中的 `.venv`，以及 `uv tool dir` 返回的工具环境，
+不会进行全盘扫描。项目支持 uv 0.4 或更高版本，运行时会检查 uv 是否存在及版本是否满足要求。
+若 uv 不存在、执行失败或输出格式无效，同步会报告失败并保留该 venv 的原有索引；GC 在同步状态不完整时会中止，避免误清理缓存。
+
+## 发布验证
+
+发布前应在 Python 3.10 至 3.13 上运行完整测试，并构建源码包和 wheel。发行物安装后应验证
+`uv-mgr --version`、`python -m uv_mgr --version` 以及非零退出码是否正确传递。本项目不在 CI 中自动上传 PyPI。

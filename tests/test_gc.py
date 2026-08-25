@@ -43,11 +43,19 @@ class TestGetPackagesAllVersionsOrphaned:
 class TestGc:
     """#71~78 gc 主函数测试。"""
 
+    def test_sync_failure_aborts_without_cleaning(self, conn, monkeypatch, capsys):
+        monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
+        with patch("uv_mgr.gc.sync_all", return_value=False), patch("subprocess.run") as mock_run:
+            code = gc(auto_sync=True)
+        assert code == 1
+        mock_run.assert_not_called()
+        assert "中止 GC" in capsys.readouterr().err
+
     def test_no_orphans(self, conn, linked_packages, capsys, monkeypatch):
         """#71 无孤立包 → 打印提示，返回 0。"""
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
         # gc 内部会调用 sync_all，需要 mock
-        with patch("uv_mgr.gc.sync_all"):
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")):
             code = gc(dry_run=False, auto_sync=False)
         assert code == 0
         captured = capsys.readouterr()
@@ -63,7 +71,7 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"):
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")):
             code = gc(dry_run=True, auto_sync=False)
 
         assert code == 0
@@ -82,7 +90,7 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run") as mock_run:
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             code = gc(dry_run=False, auto_sync=False)
 
@@ -108,8 +116,8 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all") as mock_sync:
-            with patch("subprocess.run") as mock_run:
+        with patch("uv_mgr.gc.sync_all", return_value=True) as mock_sync:
+            with patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
                 gc(dry_run=False, auto_sync=False)
         mock_sync.assert_not_called()
@@ -124,7 +132,7 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run") as mock_run:
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error msg")
             gc(dry_run=False, auto_sync=False)
 
@@ -149,7 +157,7 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="uv", timeout=120)):
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="uv", timeout=120)):
             gc(dry_run=False, auto_sync=False)
 
         captured = capsys.readouterr()
@@ -165,7 +173,7 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run", side_effect=FileNotFoundError):
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run", side_effect=FileNotFoundError):
             code = gc(dry_run=False, auto_sync=False)
 
         assert code == 1
@@ -183,7 +191,7 @@ class TestGc:
         remove_venv(conn, "/tmp/venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run") as mock_run:
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run") as mock_run:
             # good-pkg 成功，bad-pkg 失败
             def side_effect(cmd, **kwargs):
                 if "good-pkg" in cmd:

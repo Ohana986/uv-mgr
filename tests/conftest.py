@@ -66,8 +66,8 @@ def mock_uv_run_success():
 def mock_scan_venv():
     """Mock sync.scan_venv_packages 返回可控的包列表。
 
-    用法:
-        mock_scan_venv.return_value = [("requests", "2.31.0")]
+        用法:
+        mock_scan_venv.return_value = ([("requests", "2.31.0")], True)
     """
     with patch("uv_mgr.sync.scan_venv_packages") as mock:
         yield mock

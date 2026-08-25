@@ -20,7 +20,7 @@ class TestFullLifecycle:
 
         # ── sync（mock 扫描结果）──
         with patch("uv_mgr.sync.scan_venv_packages") as mock_scan:
-            mock_scan.return_value = [("requests", "2.31.0"), ("flask", "3.0.0")]
+            mock_scan.return_value = ([("requests", "2.31.0"), ("flask", "3.0.0")], True)
             from uv_mgr.sync import sync_venv
             monkeypatch.setattr(Path, "exists", lambda self: True)
             monkeypatch.setattr(os.path, "isdir", lambda p: True)
@@ -37,7 +37,7 @@ class TestFullLifecycle:
         # ── gc --dry-run ──
         from uv_mgr.gc import gc
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"):
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")):
             code = gc(dry_run=True, auto_sync=False)
         assert code == 0
 
@@ -50,7 +50,7 @@ class TestFullLifecycle:
         remove_venv(conn, "/tmp/integration-venv")
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run") as mock_run:
+        with patch("uv_mgr.gc.sync_all", return_value=True), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             code = gc(dry_run=False, auto_sync=False)
         assert code == 0
@@ -114,7 +114,7 @@ class TestRemoveThenGc:
         assert len(get_orphan_packages(conn)) == 1
 
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
-        with patch("uv_mgr.gc.sync_all"), patch("subprocess.run") as mock_run:
+        with patch("uv_mgr.gc.sync_all"), patch("uv_mgr.gc.check_uv_version", return_value=(True, "0.4.0")), patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             from uv_mgr.gc import gc
             gc(dry_run=False, auto_sync=False)

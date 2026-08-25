@@ -22,6 +22,7 @@ from uv_mgr.sync import (
     run_uv_passthrough,
     sync_all,
     sync_venv,
+    venv_python_path,
 )
 from uv_mgr.gc import gc
 
@@ -101,6 +102,9 @@ def _cmd_add(args) -> int:
     if not os.path.isdir(path):
         print(f"错误: 目录不存在: {path}", file=sys.stderr)
         return 1
+    if venv_python_path(path) is None:
+        print(f"错误: 不是有效的 venv（未找到 Python 解释器: {path}/bin/python 或 {path}/Scripts/python.exe）", file=sys.stderr)
+        return 1
     conn = get_connection()
     add_venv(conn, path)
     print(f"已注册 venv: {path}")
@@ -113,7 +117,7 @@ def _cmd_remove(args) -> int:
     conn = get_connection()
     if remove_venv(conn, path):
         print(f"已移除 venv: {path}")
-        print("提示: 可运行 uv-mgr gc 清理对应的孤立缓存包")
+        print("提示: 可运行 uv-mgr index gc 清理对应的孤立缓存包")
     else:
         print(f"未找到已注册的 venv: {path}")
         conn.close()
@@ -163,14 +167,18 @@ def _cmd_list(args) -> int:
 
 def _cmd_sync(args) -> int:
     conn = get_connection()
-    if args.venv_path:
-        sync_venv(conn, os.path.abspath(args.venv_path),
-                  auto_register=True, prune=args.prune, verbose=args.verbose)
-    else:
-        sync_all(conn, auto_discover=True, prune=args.prune,
-                 verbose=args.verbose)
-    conn.close()
-    return 0
+    try:
+        if args.venv_path:
+            success = sync_venv(
+                conn, os.path.abspath(args.venv_path),
+                auto_register=True, prune=args.prune, verbose=args.verbose,
+            )
+        else:
+            success = sync_all(conn, auto_discover=True, prune=args.prune,
+                               verbose=args.verbose)
+        return 0 if success else 1
+    finally:
+        conn.close()
 
 
 def _cmd_gc(args) -> int:
@@ -192,11 +200,6 @@ def _cmd_db(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    # 初始化数据库
-    conn = get_connection()
-    init_db(conn)
-    conn.close()
-
     if argv is None:
         argv = sys.argv[1:]
 
@@ -213,6 +216,16 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         _build_parser().print_help()
         return 0
+
+    # 自身版本请求：显示 uv-mgr 版本，不透传 uv、不触发 sync
+    if argv[0] in ("--version", "-V"):
+        print(f"uv-mgr {__version__}")
+        return 0
+
+    # 初始化数据库（版本查询不依赖数据库可用性）
+    conn = get_connection()
+    init_db(conn)
+    conn.close()
 
     # 检查是否为 uv-mgr 自有命令
     if argv[0] in OWN_COMMANDS:
@@ -255,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             if verbose:
                 print("\n正在同步 venv 状态...")
             conn = get_connection()
-            sync_all(conn, auto_discover=True, verbose=verbose)
+            sync_ok = sync_all(conn, auto_discover=True, verbose=verbose)
             conn.close()
+            if not sync_ok:
+                return 1
         return code

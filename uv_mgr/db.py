@@ -92,6 +92,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         version = int(row[0])
         if version < 2:
             _migrate_v1_to_v2(conn)
+        elif version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"数据库 schema 版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}，"
+                "请升级 uv-mgr。"
+            )
     conn.commit()
 
 

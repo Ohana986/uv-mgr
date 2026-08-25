@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install pytest
+      - run: python -m pytest -q
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Check build artifacts
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          files = glob.glob('dist/*')
+          assert any(path.endswith('.whl') for path in files)
+          assert any(path.endswith('.tar.gz') for path in files)
+          for path in files:
+              if path.endswith('.whl'):
+                  with zipfile.ZipFile(path) as archive:
+                      names = archive.namelist()
+                      assert not any(name.startswith(('tests/', 'build/', '.pytest_cache/')) for name in names)
+          PY
+      - run: python -m pip install dist/*.whl
+      - run: uv-mgr --version
+      - run: python -m uv_mgr --version

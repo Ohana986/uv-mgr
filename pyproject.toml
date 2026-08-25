@@ -1,13 +1,14 @@
 [project]
 name = "uv-mgr"
-version = "0.1.0"
+dynamic = ["version"]
 description = "uv 包装器：全局索引管理 + 孤立包垃圾回收"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+authors = [{ name = "xr_w", email = "2662539512@qq.com" }]
 keywords = ["uv", "package-management", "cache", "gc", "python"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
@@ -27,16 +28,17 @@ Repository = "https://github.com/xr-w/uv-mgr"
 uv-mgr = "uv_mgr.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=9.1.1"]
+dev = ["build>=1.2", "pytest>=9.1.1"]
 
 [build-system]
 requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "uv_mgr.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["uv_mgr*"]
 
 [tool.uv]
 package = true
-
-authors = [{ name = "XR_W", email = "2662539512@QQ.com" }]

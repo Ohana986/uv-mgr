@@ -22,14 +22,20 @@ class TestMainEntry:
         assert "usage:" in captured.out
 
     def test_version(self, capsys, monkeypatch):
-        """#47 --version 打印版本号。"""
+        """#47 --version 打印 uv-mgr 自身版本号，不透传 uv、不触发 sync。"""
+        from uv_mgr import __version__
         from uv_mgr.cli import main
         with patch("uv_mgr.cli.get_connection"), patch("uv_mgr.cli.init_db"):
-            with patch("uv_mgr.cli.run_uv_passthrough") as mock_uv:
-                mock_uv.return_value = 0
-                code = main(["--version"])
-        # --version 当前被透传给 uv, 由 uv 返回版本号
+            code = main(["--version"])
         assert code == 0
+        out = capsys.readouterr().out
+        assert f"uv-mgr {__version__}" in out
+
+    def test_version_does_not_require_database(self, capsys):
+        from uv_mgr.cli import main
+        with patch("uv_mgr.cli.get_connection", side_effect=RuntimeError("database unavailable")):
+            assert main(["--version"]) == 0
+        assert "uv-mgr" in capsys.readouterr().out
 
 
 # ── #48~52 add / remove ───────────────────────────────────────────
@@ -39,6 +45,7 @@ class TestAddRemoveCommands:
         """#48 add 有效路径 → 注册成功。"""
         monkeypatch.setattr("uv_mgr.cli.get_connection", lambda: conn)
         monkeypatch.setattr(os.path, "isdir", lambda p: True)
+        monkeypatch.setattr(Path, "exists", lambda self: True)
         from uv_mgr.cli import _cmd_add
         args = MagicMock(venv_path="/tmp/valid-venv")
         code = _cmd_add(args)
@@ -74,6 +81,7 @@ class TestAddRemoveCommands:
         monkeypatch.setattr("uv_mgr.db.DB_PATH", db_path)
         monkeypatch.setattr("uv_mgr.db.DB_DIR", db_path.parent)
         monkeypatch.setattr(os.path, "isdir", lambda p: True)
+        monkeypatch.setattr(Path, "exists", lambda self: True)
         # 先初始化数据库
         init_db(fresh_conn())
         from uv_mgr.cli import _cmd_add

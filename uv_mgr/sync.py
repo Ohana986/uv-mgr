@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import re
 from pathlib import Path
 
 from uv_mgr.db import (
@@ -18,11 +19,58 @@ from uv_mgr.db import (
     get_venvs_by_source,
 )
 
+
 # 跳过 sync 的 uv 子命令
 SKIP_SYNC_COMMANDS = frozenset({
     "self", "help", "version", "cache", "completions",
     "generate-shell-completion", "generate-default-namespace",
 })
+
+MIN_UV_VERSION = (0, 4)
+
+
+def _parse_version(value: str) -> tuple[int, ...] | None:
+    """解析 uv 的版本输出，忽略开发版后缀。"""
+    if not isinstance(value, str):
+        return None
+    try:
+        match = re.search(r"(?:^|\s)v?(\d+(?:\.\d+)+)", value)
+        if not match:
+            return None
+        return tuple(int(part) for part in match.group(1).split("."))
+    except (IndexError, ValueError):
+        return None
+
+
+def check_uv_version() -> tuple[bool, str]:
+    """检查 uv 是否存在且满足最低版本要求。"""
+    try:
+        result = subprocess.run(
+            ["uv", "--version"], capture_output=True, text=True, timeout=10
+        )
+    except FileNotFoundError:
+        return False, "找不到 uv 命令，请先安装 uv"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"无法执行 uv --version：{exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return False, f"uv 版本检查失败{(': ' + detail) if detail else ''}"
+    version = _parse_version(result.stdout or result.stderr)
+    if version is None:
+        return False, "无法解析 uv 版本，请升级 uv 后重试"
+    if version < MIN_UV_VERSION:
+        return False, f"uv 版本过低（当前 {'.'.join(map(str, version))}），最低支持 0.4"
+    return True, ".".join(map(str, version))
+
+
+def venv_python_path(venv_path: str) -> Path | None:
+    """返回不同平台常见的 venv Python 解释器路径。"""
+    root = Path(venv_path)
+    for candidate in (root / "bin" / "python", root / "Scripts" / "python.exe",
+                      root / "Scripts" / "python"):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def should_sync_after_uv(args: list[str]) -> bool:
@@ -55,8 +103,13 @@ def discover_tool_venvs() -> list[str]:
         return []
 
 
-def scan_venv_packages(venv_python: str) -> list[tuple[str, str]]:
-    """扫描指定 venv 中的已安装包，返回 [(name, version), ...]。"""
+def scan_venv_packages(venv_python: str, *, check_uv: bool = True) -> tuple[list[tuple[str, str]], bool]:
+    """扫描指定 venv，返回 ``(包列表, 是否成功)``。"""
+    if check_uv:
+        ok, message = check_uv_version()
+        if not ok:
+            print(f"警告: {message}", file=sys.stderr)
+            return [], False
     try:
         result = subprocess.run(
             ["uv", "pip", "list", "--python", venv_python,
@@ -66,30 +119,34 @@ def scan_venv_packages(venv_python: str) -> list[tuple[str, str]]:
         if result.returncode != 0:
             print(f"警告: 扫描 {venv_python} 失败:\n{result.stderr}",
                   file=sys.stderr)
-            return []
+            return [], False
         data = json.loads(result.stdout)
+        if not isinstance(data, list):
+            raise ValueError("uv 返回的包列表不是 JSON 数组")
         # uv 返回格式: [{"name": "pip", "version": "26.1.2"}, ...]
-        return [(entry["name"], entry["version"]) for entry in data]
-    except (json.JSONDecodeError, subprocess.TimeoutExpired,
-            FileNotFoundError) as e:
+        packages = [(entry["name"], entry["version"]) for entry in data]
+        return packages, True
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError,
+            subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         print(f"警告: 扫描 venv 异常: {e}", file=sys.stderr)
-        return []
+        return [], False
 
 
 def sync_venv(conn, venv_path: str, *,
               auto_register: bool = False, prune: bool = False,
-              source: str = 'auto', verbose: bool = False) -> None:
-    """同步单个 venv 的包状态到数据库。"""
+              source: str = 'auto', verbose: bool = False,
+              check_uv: bool = True) -> bool:
+    """同步单个 venv 的包状态到数据库，返回是否成功。"""
     venv = get_venv_by_path(conn, venv_path)
 
     # 自动注册
     if venv is None:
         if not auto_register:
-            print(f"未注册的 venv: {venv_path}，请先运行 uv-mgr add {venv_path}")
-            return
+            print(f"未注册的 venv: {venv_path}，请先运行 uv-mgr index add {venv_path}")
+            return False
         if not os.path.isdir(venv_path):
             print(f"错误: venv 目录不存在: {venv_path}", file=sys.stderr)
-            return
+            return False
         add_venv(conn, venv_path, source=source)
         venv = get_venv_by_path(conn, venv_path)
 
@@ -101,13 +158,13 @@ def sync_venv(conn, venv_path: str, *,
             print(f"已清理失效记录: {venv_path}")
         else:
             print("提示: 使用 --prune 自动清理失效记录", file=sys.stderr)
-        return
+        return False
 
     # 找 python 解释器
-    python_path = Path(venv_path) / "bin" / "python"
-    if not python_path.exists():
-        print(f"警告: 未找到 Python 解释器: {python_path}", file=sys.stderr)
-        return
+    python_path = venv_python_path(venv_path)
+    if python_path is None:
+        print(f"警告: 未找到 Python 解释器: {venv_path}/bin/python（Windows 可使用 Scripts/python.exe）", file=sys.stderr)
+        return False
 
     # 获取并记录 Python 版本
     python_version = None
@@ -125,7 +182,11 @@ def sync_venv(conn, venv_path: str, *,
         pass
 
     # 扫描已安装包
-    packages = scan_venv_packages(str(python_path))
+    scan_result = scan_venv_packages(str(python_path), check_uv=check_uv)
+    packages, success = scan_result
+    if not success:
+        print(f"警告: 扫描失败，保留 {venv_path} 的现有索引记录。", file=sys.stderr)
+        return False
     if not packages:
         if verbose:
             print(f"信息: {venv_path} 中没有已安装的包")
@@ -136,7 +197,7 @@ def sync_venv(conn, venv_path: str, *,
             conn.commit()
         if verbose:
             print(f"已同步: {venv_path}（0 个包）")
-        return
+        return True
 
     # 确保所有包在 packages 表中存在，获取 ID
     pkg_ids = [ensure_package(conn, name, ver) for name, ver in packages]
@@ -148,15 +209,21 @@ def sync_venv(conn, venv_path: str, *,
         conn.commit()
     if verbose:
         print(f"已同步: {venv_path}（{len(packages)} 个包）")
+    return True
 
 
 def sync_all(conn, *, auto_discover: bool = True, prune: bool = False,
-             verbose: bool = False) -> None:
-    """同步所有已注册 venv，并可选自动发现新 venv 及 uv tool。"""
+             verbose: bool = False) -> bool:
+    """同步所有已注册 venv，返回是否所有环境均同步成功。"""
     venvs = list_venvs(conn)
     if not venvs and not auto_discover:
         print("没有已注册的 venv。")
-        return
+        return True
+
+    ok, message = check_uv_version()
+    if not ok:
+        print(f"错误: {message}", file=sys.stderr)
+        return False
 
     # 自动发现：扫描常见位置
     discovered = set()
@@ -192,13 +259,20 @@ def sync_all(conn, *, auto_discover: bool = True, prune: bool = False,
             known_paths.add(tp)
 
     # 逐个同步（包括 tool venv）
+    all_success = True
     for v in list_venvs(conn):
-        sync_venv(conn, v["path"], auto_register=False, prune=prune,
-                  verbose=verbose)
+        if not sync_venv(conn, v["path"], auto_register=False, prune=prune,
+                         verbose=verbose, check_uv=False):
+            all_success = False
+    return all_success
 
 
 def run_uv_passthrough(args: list[str]) -> int:
     """透传执行 uv 命令。"""
+    ok, message = check_uv_version()
+    if not ok:
+        print(f"错误: {message}", file=sys.stderr)
+        return 1
     cmd = ["uv"] + args
     try:
         proc = subprocess.run(cmd)
