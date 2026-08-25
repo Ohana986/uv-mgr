@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 DB_DIR = Path.home() / ".local" / "share" / "uv-mgr"
 DB_PATH = DB_DIR / "index.db"
@@ -110,6 +110,20 @@ CREATE TABLE IF NOT EXISTS cache_rebuild_failures (
     attempts     INTEGER NOT NULL DEFAULT 1,
     last_error   TEXT NOT NULL,
     last_failed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cache_rebuild_baseline (
+    name       TEXT NOT NULL,
+    version    TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY (name, version)
+);
+
+CREATE TABLE IF NOT EXISTS tool_rebuild_metadata (
+    environment_path TEXT PRIMARY KEY,
+    arguments_json   TEXT NOT NULL,
+    python_version   TEXT NOT NULL,
+    recorded_at      TEXT NOT NULL
 );
 """
 
@@ -227,6 +241,32 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     print("数据库迁移: v6 → v7（缓存重建失败记录已改为按环境保存）")
 
 
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """保存上次缓存重建时已观察到的未使用版本。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS cache_rebuild_baseline (
+        name TEXT NOT NULL,
+        version TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY (name, version)
+    )""")
+    conn.execute("UPDATE _meta SET value = '8' WHERE key = 'schema_version'")
+    conn.commit()
+    print("数据库迁移: v7 → v8（已启用缓存重建增量基线）")
+
+
+def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """保存由 uv-mgr 安装的 tool 的安全重放元数据。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS tool_rebuild_metadata (
+        environment_path TEXT PRIMARY KEY,
+        arguments_json TEXT NOT NULL,
+        python_version TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    )""")
+    conn.execute("UPDATE _meta SET value = '9' WHERE key = 'schema_version'")
+    conn.commit()
+    print("数据库迁移: v8 → v9（已启用 uv tool 重建元数据）")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     cur = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'")
@@ -255,6 +295,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             version = 6
         if version < 7:
             _migrate_v6_to_v7(conn)
+            version = 7
+        if version < 8:
+            _migrate_v7_to_v8(conn)
+            version = 8
+        if version < 9:
+            _migrate_v8_to_v9(conn)
         elif version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"数据库 schema 版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}，"
@@ -285,6 +331,7 @@ def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
 
 
 def remove_venv(conn: sqlite3.Connection, path: str) -> bool:
+    conn.execute("DELETE FROM tool_rebuild_metadata WHERE environment_path = ?", (path,))
     cur = conn.execute("DELETE FROM venvs WHERE path = ?", (path,))
     conn.commit()
     if cur.rowcount > 0:
@@ -574,20 +621,81 @@ def remove_orphan_packages(conn: sqlite3.Connection, ids: list[int]) -> None:
     conn.commit()
 
 
-def get_rebuild_package_names(conn: sqlite3.Connection) -> list[str]:
-    """返回当前仍在用、但历史快照已有其他版本的包名。"""
+def get_new_rebuild_packages(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """返回上次重建后新出现、且目前不再被任何环境使用的包版本。
+
+    首次执行时基线为空，所有满足条件的历史版本都会被返回。每次成功清理
+    待重建缓存后，调用方会把当前完整状态写回基线；因此后续只会处理新增项。
+    """
     rows = conn.execute(
-        """WITH current_packages AS (
-               SELECT DISTINCT p.name, p.version
+        """WITH current_names AS (
+               SELECT DISTINCT p.name
+               FROM packages p JOIN venv_packages vp ON vp.package_id = p.id
+           ), historical_versions AS (
+               SELECT DISTINCT old.name, old.version
+               FROM snapshot_packages old
+               JOIN current_names current ON current.name = old.name
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM packages active
+                   JOIN venv_packages link ON link.package_id = active.id
+                   WHERE active.name = old.name AND active.version = old.version
+               )
+           )
+           SELECT historical.name, historical.version
+           FROM historical_versions historical
+           LEFT JOIN cache_rebuild_baseline baseline
+             ON baseline.name = historical.name AND baseline.version = historical.version
+           WHERE baseline.name IS NULL
+           ORDER BY historical.name, historical.version"""
+    ).fetchall()
+    return rows
+
+
+def replace_rebuild_baseline(conn: sqlite3.Connection) -> None:
+    """以当前未使用历史版本替换重建增量基线。"""
+    now = _now()
+    conn.execute("DELETE FROM cache_rebuild_baseline")
+    conn.execute(
+        """INSERT INTO cache_rebuild_baseline (name, version, observed_at)
+           WITH current_names AS (
+               SELECT DISTINCT p.name
                FROM packages p JOIN venv_packages vp ON vp.package_id = p.id
            )
-           SELECT DISTINCT current.name
-           FROM current_packages current
-           JOIN snapshot_packages old ON old.name = current.name
-           WHERE old.version != current.version
-           ORDER BY current.name"""
-    ).fetchall()
-    return [row["name"] for row in rows]
+           SELECT DISTINCT old.name, old.version, ?
+           FROM snapshot_packages old
+           JOIN current_names current ON current.name = old.name
+           WHERE NOT EXISTS (
+               SELECT 1 FROM packages active
+               JOIN venv_packages link ON link.package_id = active.id
+               WHERE active.name = old.name AND active.version = old.version
+           )""",
+        (now,),
+    )
+    conn.commit()
+
+
+def record_tool_rebuild_metadata(conn: sqlite3.Connection, environment_path: str,
+                                 arguments_json: str, python_version: str) -> None:
+    """保存由 uv-mgr 安装的 tool 的安全重放参数。"""
+    conn.execute(
+        """INSERT INTO tool_rebuild_metadata
+           (environment_path, arguments_json, python_version, recorded_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(environment_path) DO UPDATE SET
+             arguments_json = excluded.arguments_json,
+             python_version = excluded.python_version,
+             recorded_at = excluded.recorded_at""",
+        (environment_path, arguments_json, python_version, _now()),
+    )
+    conn.commit()
+
+
+def get_tool_rebuild_metadata(conn: sqlite3.Connection, environment_path: str):
+    """取得指定 tool 环境的安全重放元数据。"""
+    return conn.execute(
+        "SELECT * FROM tool_rebuild_metadata WHERE environment_path = ?",
+        (environment_path,),
+    ).fetchone()
 
 
 def record_rebuild_failure(conn: sqlite3.Connection, environment_path: str,

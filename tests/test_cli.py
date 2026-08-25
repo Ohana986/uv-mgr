@@ -7,6 +7,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+class TestToolReplayArguments:
+    def test_extracts_whitelisted_arguments(self):
+        from uv_mgr.cli import _extract_tool_replay_command
+
+        assert _extract_tool_replay_command([
+            "tool", "install", "demo", "--with", "extra", "--editable",
+            "--link-mode=copy", "--python", "3.12",
+        ]) == [
+            "uv", "tool", "install", "demo", "--with", "extra", "--editable",
+            "--link-mode", "copy",
+        ]
+
+    def test_rejects_non_whitelisted_arguments(self):
+        from uv_mgr.cli import _extract_tool_replay_command
+
+        assert _extract_tool_replay_command([
+            "tool", "install", "demo", "--index", "https://private.example/simple",
+        ]) is None
+
+
 # ── #46 main() 顶层 ────────────────────────────────────────────────
 
 class TestMainEntry:

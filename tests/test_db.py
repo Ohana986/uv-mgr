@@ -50,6 +50,7 @@ class TestInitDb:
         assert "packages" in tables
         assert "venv_packages" in tables
         assert "_meta" in tables
+        assert "tool_rebuild_metadata" in tables
 
     # ── #2 重复初始化 ──────────────────────────────────────────
 
@@ -97,6 +98,15 @@ class TestInitDb:
             "SELECT value FROM _meta WHERE key = 'schema_version'"
         ).fetchone()[0] == str(SCHEMA_VERSION)
 
+    def test_migrate_v8_to_v9_creates_tool_rebuild_metadata(self, conn):
+        conn.execute("UPDATE _meta SET value = '8' WHERE key = 'schema_version'")
+        conn.execute("DROP TABLE tool_rebuild_metadata")
+        conn.commit()
+        init_db(conn)
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tool_rebuild_metadata'"
+        ).fetchone() is not None
+
 
 # ── #3~9 Venv CRUD ────────────────────────────────────────────────
 
@@ -123,6 +133,14 @@ class TestVenvCrud:
         assert row["path"] == "/tmp/test-venv"
         assert row["name"] == "test-venv"
         assert row["created_at"] is not None
+
+    def test_remove_venv_removes_tool_rebuild_metadata(self, conn):
+        from uv_mgr.db import get_tool_rebuild_metadata, record_tool_rebuild_metadata
+
+        add_venv(conn, "/tmp/tool", source="tool")
+        record_tool_rebuild_metadata(conn, "/tmp/tool", '["uv"]', "3.11")
+        assert remove_venv(conn, "/tmp/tool")
+        assert get_tool_rebuild_metadata(conn, "/tmp/tool") is None
 
     def test_remove_existing(self, conn):
         """#6 移除存在的 venv 返回 True，级联删除关联。"""

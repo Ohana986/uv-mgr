@@ -11,11 +11,13 @@ from uv_mgr.db import (
     get_connection,
     get_orphan_packages,
     get_rebuild_failures,
-    get_rebuild_package_names,
+    get_tool_rebuild_metadata,
+    get_new_rebuild_packages,
     list_venvs,
     prune_rebuild_failures,
     record_operation,
     record_rebuild_failure,
+    replace_rebuild_baseline,
     remove_orphan_packages,
 )
 from uv_mgr.sync import check_uv_version, sync_all
@@ -80,6 +82,69 @@ def _parse_tool_receipt(receipt: Path) -> list[str] | None:
     return command
 
 
+def _python_major_minor(value: str | None) -> str | None:
+    """将解释器版本规范为可传给 uv 的 ``major.minor``。"""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)(?:\.\d+)?\s*", value)
+    if match is None:
+        return None
+    return f"{match.group(1)}.{match.group(2)}"
+
+
+def _command_with_python(command: list[str], python_version: str | None) -> list[str] | None:
+    """为安全重放命令加入固定 Python；原命令中的 Python 由此覆盖。"""
+    python = _python_major_minor(python_version)
+    if python is None or command[:3] != ["uv", "tool", "install"]:
+        return None
+    result = command[:3] + ["--force"]
+    index = 3
+    while index < len(command):
+        argument = command[index]
+        if argument == "--force":
+            index += 1
+        elif argument == "--python":
+            if index + 1 >= len(command) or command[index + 1].startswith("-"):
+                return None
+            index += 2
+        elif argument.startswith("--python="):
+            if not argument.removeprefix("--python="):
+                return None
+            index += 1
+        else:
+            result.append(argument)
+            index += 1
+    result.extend(["--python", python])
+    return result
+
+
+def _tool_rebuild_command(conn, venv) -> tuple[list[str] | None, str | None]:
+    """优先使用 uv-mgr 元数据，否则从 receipt 和索引安全回退。"""
+    metadata = get_tool_rebuild_metadata(conn, venv["path"])
+    if metadata is not None:
+        try:
+            saved = json.loads(metadata["arguments_json"])
+            if not isinstance(saved, list) or not all(isinstance(item, str) for item in saved):
+                raise ValueError("参数格式无效")
+        except (json.JSONDecodeError, ValueError):
+            return None, "保存的 tool 重建参数损坏"
+        command = _command_with_python(saved, metadata["python_version"])
+        if command is not None:
+            return command, None
+        return None, "保存的 tool Python 版本无效"
+
+    command = _parse_tool_receipt(Path(venv["path"]) / "uv-receipt.toml")
+    if command is None:
+        return None, "uv-receipt.toml 缺失或无法安全重放"
+    receipt_python = None
+    if "--python" in command:
+        receipt_python = command[command.index("--python") + 1]
+    command = _command_with_python(command, receipt_python or venv["python_version"])
+    if command is None:
+        return None, "无法确定原 tool 的 Python 主次版本"
+    return command, None
+
+
 def _environment_package_names(conn, venv_id: int) -> set[str]:
     return {
         row["name"] for row in conn.execute(
@@ -100,14 +165,13 @@ def _get_rebuild_environments(conn, package_names: set[str]) -> tuple[list[dict]
             continue
         venv_path = Path(venv["path"])
         if venv["source"] == "tool":
-            command = _parse_tool_receipt(venv_path / "uv-receipt.toml")
+            command, reason = _tool_rebuild_command(conn, venv)
             if command is not None:
                 targets.append({
                     "path": str(venv_path), "type": "tool", "command": command,
                     "cwd": None, "packages": affected,
                 })
                 continue
-            reason = "uv-receipt.toml 缺失或无法安全重放"
         else:
             project = venv_path.parent
             if venv_path.name == ".venv" and (project / "pyproject.toml").is_file():
@@ -122,18 +186,27 @@ def _get_rebuild_environments(conn, package_names: set[str]) -> tuple[list[dict]
     return targets, skipped, protected_names
 
 
-def _run_environment(conn, environment: dict) -> bool:
-    """在原项目或原 tool 来源中恢复缓存，并维护失败记录。"""
+def _run_environment(conn, environment: dict, *, stream_output: bool = False) -> bool:
+    """在原项目或原 tool 来源中恢复缓存，并维护失败记录。
+
+    ``stream_output`` 仅供 ``gc --rebuild`` 使用，使 uv 的下载进度直接显示在终端。
+    """
     command = environment["command"]
     try:
-        result = subprocess.run(
-            command, cwd=environment["cwd"], capture_output=True, text=True, timeout=900,
-        )
+        if stream_output:
+            result = subprocess.run(command, cwd=environment["cwd"], timeout=900)
+        else:
+            result = subprocess.run(
+                command, cwd=environment["cwd"], capture_output=True, text=True, timeout=900,
+            )
         if result.returncode == 0:
             clear_rebuild_failure(conn, environment["path"])
             print(f"  已恢复: {environment['path']}")
             return True
-        error = result.stderr.strip() or result.stdout.strip() or "命令执行失败"
+        if stream_output:
+            error = "命令执行失败（详见上方 uv 输出）"
+        else:
+            error = result.stderr.strip() or result.stdout.strip() or "命令执行失败"
     except subprocess.TimeoutExpired:
         error = "恢复超时"
     except (FileNotFoundError, OSError) as exc:
@@ -227,7 +300,8 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True, rebuild: bool = False,
             prune_rebuild_failures(conn)
 
         orphans = _get_packages_all_versions_orphaned(conn)
-        candidate_names = set(get_rebuild_package_names(conn)) if rebuild else set()
+        rebuild_packages = get_new_rebuild_packages(conn) if rebuild else []
+        candidate_names = {row["name"] for row in rebuild_packages}
         targets, skipped, protected = _get_rebuild_environments(conn, candidate_names)
         clean_names = sorted(candidate_names - protected)
         targets = [target for target in targets if target["packages"] & set(clean_names)]
@@ -235,6 +309,7 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True, rebuild: bool = False,
         if dry_run:
             print(f"[dry-run] 将清理 {len(orphans)} 个完全孤立包。")
             if rebuild:
+                print(f"[dry-run] 检测到 {len(rebuild_packages)} 个上次重建后新增的未使用包版本。")
                 print(f"[dry-run] 将以一次 uv cache clean 清理 {len(clean_names)} 个候选包名。")
                 if clean_names:
                     print("  uv cache clean " + " ".join(clean_names))
@@ -246,6 +321,7 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True, rebuild: bool = False,
 
         cleaned_names, clean_failed = _clean_orphans(conn, orphans)
         rebuild_failed = 0
+        rebuild_clean_ok = True
         if rebuild and clean_names:
             print(f"正在一次清理 {len(clean_names)} 个待重建包名...")
             try:
@@ -262,7 +338,12 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True, rebuild: bool = False,
                 rebuild_failed = len(targets)
             else:
                 print(f"正在恢复 {len(targets)} 个受影响环境：")
-                rebuild_failed = sum(not _run_environment(conn, target) for target in targets)
+                rebuild_failed = sum(
+                    not _run_environment(conn, target, stream_output=True) for target in targets
+                )
+        if rebuild and rebuild_clean_ok:
+            # 缓存清理失败时保留旧基线，以便下一次仍能处理同一批版本。
+            replace_rebuild_baseline(conn)
         for item in skipped:
             print(f"跳过 {item['path']}: {item['reason']}；保留相关缓存。")
         print(f"\n已清理 {len(cleaned_names)}/{len(orphans)} 个孤立包。")

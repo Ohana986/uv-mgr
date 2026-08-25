@@ -1,7 +1,9 @@
 """CLI 入口：参数解析、命令路由、uv 透传。"""
 
 import argparse
+import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -20,7 +22,9 @@ from uv_mgr.db import (
     get_package_events,
     get_snapshots,
     get_snapshot_packages,
+    get_venv_by_path,
     record_operation,
+    record_tool_rebuild_metadata,
 )
 from uv_mgr.sync import (
     should_sync_after_uv,
@@ -28,13 +32,99 @@ from uv_mgr.sync import (
     sync_all,
     sync_venv,
     venv_python_path,
+    discover_tool_venvs,
 )
-from uv_mgr.gc import gc as clean_cache
+from uv_mgr.gc import _parse_tool_receipt, gc as clean_cache
 
 # uv-mgr 自有命令（不透传 uv）
 OWN_COMMANDS = frozenset({
     "index", "db", "gc",
 })
+
+_TOOL_REPLAY_OPTIONS = {
+    "--with": ("--with", True), "-w": ("--with", True),
+    "--editable": ("--editable", False), "-e": ("--editable", False),
+    "--with-editable": ("--with-editable", True),
+    "--with-executables-from": ("--with-executables-from", True),
+    "--python-platform": ("--python-platform", True),
+    "--link-mode": ("--link-mode", True),
+    "--compile-bytecode": ("--compile-bytecode", False),
+    "--resolution": ("--resolution", True),
+    "--prerelease": ("--prerelease", True),
+    "--exclude-newer": ("--exclude-newer", True),
+    "--torch-backend": ("--torch-backend", True),
+}
+
+
+def _python_major_minor(value: str | None) -> str | None:
+    match = re.fullmatch(r"\s*(\d+)\.(\d+)(?:\.\d+)?\s*", value or "")
+    return f"{match.group(1)}.{match.group(2)}" if match else None
+
+
+def _extract_tool_replay_command(args: list[str]) -> list[str] | None:
+    """从常规 tool install 中提取可安全持久化的白名单参数。"""
+    if len(args) < 3 or args[:2] != ["tool", "install"] or args[2].startswith("-"):
+        return None
+    replay = ["uv", "tool", "install", args[2]]
+    index = 3
+    while index < len(args):
+        option = args[index]
+        if option == "--python" or option.startswith("--python=") or option == "-p":
+            if option == "--python" or option == "-p":
+                index += 1
+                if index >= len(args) or args[index].startswith("-"):
+                    return None
+            index += 1
+            continue
+        if option == "--force":
+            index += 1
+            continue
+        name, separator, inline_value = option.partition("=")
+        details = _TOOL_REPLAY_OPTIONS.get(name)
+        if details is None:
+            return None
+        canonical, needs_value = details
+        replay.append(canonical)
+        if needs_value:
+            if separator:
+                if not inline_value:
+                    return None
+                replay.append(inline_value)
+            else:
+                index += 1
+                if index >= len(args) or args[index].startswith("-"):
+                    return None
+                replay.append(args[index])
+        elif separator:
+            return None
+        index += 1
+    return replay
+
+
+def _tool_primary_requirement(venv_path: str) -> str | None:
+    command = _parse_tool_receipt(Path(venv_path) / "uv-receipt.toml")
+    if command is None or len(command) < 5:
+        return None
+    return command[4]
+
+
+def _record_tool_install(conn, replay_command: list[str], before_paths: set[str]) -> None:
+    """在同步后将常规 tool install 的重放数据绑定到唯一 tool 环境。"""
+    primary = replay_command[3]
+    after_paths = set(discover_tool_venvs())
+    candidates = [path for path in after_paths if _tool_primary_requirement(path) == primary]
+    new_candidates = [path for path in candidates if path not in before_paths]
+    if len(new_candidates) == 1:
+        candidates = new_candidates
+    if len(candidates) != 1:
+        return
+    venv = get_venv_by_path(conn, candidates[0])
+    if venv is None:
+        return
+    python = _python_major_minor(venv["python_version"])
+    if python is None:
+        return
+    record_tool_rebuild_metadata(conn, candidates[0], json.dumps(replay_command), python)
 
 
 _HELP_EPILOG = """\
@@ -99,7 +189,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gc = sub.add_parser("gc", help="清理完全孤立包名对应的缓存")
     p_gc.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
     p_gc.add_argument("--rebuild", action="store_true",
-                      help="一次清理候选包缓存，并在原环境中恢复")
+                      help="清理上次重建后新增的未使用旧版本缓存，并在原环境中恢复")
     p_gc.add_argument("--retry", action="store_true",
                       help="重试上次重建失败的环境（必须与 --rebuild 一起使用）")
 
@@ -373,12 +463,16 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
     else:
         # 透传给 uv
+        tool_replay = _extract_tool_replay_command(argv)
+        tool_paths_before = set(discover_tool_venvs()) if tool_replay is not None else set()
         code = run_uv_passthrough(argv)
         if code == 0 and should_sync_after_uv(argv):
             if verbose:
                 print("\n正在同步 venv 状态...")
             conn = get_connection()
             sync_ok = sync_all(conn, auto_discover=True, verbose=verbose)
+            if sync_ok and tool_replay is not None:
+                _record_tool_install(conn, tool_replay, tool_paths_before)
             conn.close()
             if not sync_ok:
                 return 1
