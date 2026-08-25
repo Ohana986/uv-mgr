@@ -81,26 +81,26 @@ uv-mgr index list
 uv-mgr index sync
 
 # 同步后自动清理已删除的 venv 记录
-uv-mgr index sync --prune
+uv-mgr index gc
 
 # 显示每个 venv 的同步详情（默认静默）
 uv-mgr index sync --verbose
 ```
 
 > 同步成功的"已同步"详情默认隐藏。需要查看时加 `-v` / `--verbose`：
-> `uv-mgr -v <uv 命令>`（透传 uv 后）或 `uv-mgr index sync -v`、`uv-mgr index gc -v`。
+> `uv-mgr -v <uv 命令>`（透传 uv 后）或 `uv-mgr index sync -v`、`uv-mgr index gc -v`、`uv-mgr gc -v`。
 
 **垃圾回收**
 
 ```bash
 # 预览：查看将要清理哪些包
-uv-mgr index gc --dry-run
+uv-mgr gc --dry-run
 
 # 执行清理：调用 uv cache clean <pkg> 删除孤立缓存
-uv-mgr index gc
+uv-mgr gc
 
 # 同时处理有旧版本记录的在用包：清空包名缓存后，以临时项目重建当前版本
-uv-mgr index gc --rebuild
+uv-mgr gc --rebuild
 ```
 
 ### 数据库信息
@@ -135,8 +135,9 @@ uv-mgr db history --snapshots --venv /path/to/venv
 | 创建 venv | `uv-mgr venv --python 3.11` |
 | 注册 venv 到索引 | `uv-mgr index add .venv` |
 | 查看索引状态 | `uv-mgr index list` |
-| 同步索引 | `uv-mgr index sync --prune` |
-| 清理孤立缓存 | `uv-mgr index gc` |
+| 同步索引 | `uv-mgr index sync` |
+| 同步索引并清理失效 venv 记录 | `uv-mgr index gc` |
+| 清理孤立缓存 | `uv-mgr gc` |
 | 查看 uv 命令 | `uv-mgr --help` |
 | 查看 uv-mgr 命令 | `uv-mgr`（无参数）或 `uv-mgr index --help` |
 
@@ -144,9 +145,9 @@ uv-mgr db history --snapshots --venv /path/to/venv
 
 - **安全优先**：仅当某个包的**所有版本**都不被任何 venv 引用时，才 `uv cache clean <pkg>`
 - **历史记录清理**：每次 venv 成功同步后，自动删除“未被引用但同名其他版本仍在使用”的数据库历史版本；完全没有版本被引用的包记录会保留给 GC 判断
-- **分离原则**：`index sync` 只更新索引，`index gc` 才执行物理删除——给用户反悔空间
+- **分离原则**：`index sync` 只更新索引，`index gc` 在同步时清理失效 venv 记录，只有 `gc` 才执行物理缓存删除——给用户反悔空间
 - **预览模式**：`--dry-run` 可查看影响范围后再执行
-- **旧版本重建**：`uv-mgr index gc --rebuild` 只处理同步历史中出现过旧版本、且当前仍有版本被 venv 使用的包。它先执行 `uv cache clean <包名>`，再在 `/tmp` 的临时项目中逐个 `uv add 包名==当前版本`，以重新填充缓存。成功重建后，在没有再次清理同名缓存前不会重复处理；同一包名再次重建时会使旧成功记录失效。重建失败会记录下来，下次运行同一命令会重试。
+- **旧版本重建**：`uv-mgr gc --rebuild` 只处理同步历史中出现过旧版本、且当前仍有版本被 venv 使用的包。它先执行 `uv cache clean <包名>`，再在 `/tmp` 的临时项目中逐个 `uv add 包名==当前版本`，以重新填充缓存。成功重建后，在没有再次清理同名缓存前不会重复处理；同一包名再次重建时会使旧成功记录失效。重建失败会记录下来，下次运行同一命令会重试。
 
 数据库索引记录的是各 venv 的最终安装清单，不等同于 uv 的全量缓存。缓存中未被索引的构建依赖或下载包不会被自动判定为垃圾；数据库中没有对应缓存的历史记录也不会直接触发缓存删除。
 

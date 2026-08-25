@@ -142,7 +142,7 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
             print(f"\n[dry-run] 将清理 {len(orphans)} 个完全孤立包，共 {total_versions} 个版本")
             if rebuild_packages:
                 print(f"[dry-run] 将重建 {len(rebuild_packages)} 个包的 {len(rebuild_rows)} 个在用版本")
-            print("[dry-run] 未执行实际清理。运行 uv-mgr index gc（不带 --dry-run）以执行。")
+            print("[dry-run] 未执行实际清理。运行 uv-mgr gc（不带 --dry-run）以执行。")
             record_operation(
                 conn, "gc_dry_run",
                 summary=f"预览 {len(orphans)} 个包、{total_versions} 个版本",

@@ -29,17 +29,18 @@ from uv_mgr.sync import (
     sync_venv,
     venv_python_path,
 )
-from uv_mgr.gc import gc
+from uv_mgr.gc import gc as clean_cache
 
 # uv-mgr 自有命令（不透传 uv）
 OWN_COMMANDS = frozenset({
-    "index", "db",
+    "index", "db", "gc",
 })
 
 
 _HELP_EPILOG = """\
 Learn uv commands:  use 'uv-mgr <command>' to run any uv command (e.g. uv-mgr sync)
-Index management:   use 'uv-mgr index <command>' (e.g. uv-mgr index gc --dry-run)
+Index management:   use 'uv-mgr index <command>' (e.g. uv-mgr index gc)
+Cache cleanup:      use 'uv-mgr gc' (e.g. uv-mgr gc --dry-run)
 """
 
 
@@ -61,7 +62,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     # ── index 子命令（索引管理） ─────────────────────────────────
-    p_idx = sub.add_parser("index", help="索引管理：注册/清理/同步/GC")
+    p_idx = sub.add_parser("index", help="索引管理：注册/查询/同步/清理失效记录")
     idx_sub = p_idx.add_subparsers(dest="index_command", metavar="<subcommand>")
 
     # index add
@@ -84,17 +85,22 @@ def _build_parser() -> argparse.ArgumentParser:
     # index sync
     p_is = idx_sub.add_parser("sync", help="同步 venv 包状态到索引")
     p_is.add_argument("venv_path", nargs="?", default=None, help="指定 venv 路径（默认全部）")
-    p_is.add_argument("--prune", action="store_true",
-                      help="同步时自动清理已不存在的 venv 记录")
     p_is.add_argument("-v", "--verbose", action="store_true",
                       help="显示每个 venv 的同步详情（默认隐藏）")
 
     # index gc
-    p_ig = idx_sub.add_parser("gc", help="清理完全孤立包名对应的缓存")
-    p_ig.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
-    p_ig.add_argument("--rebuild", action="store_true",
-                      help="清理有旧版本记录的包，并重建仍在使用的版本缓存")
+    p_ig = idx_sub.add_parser("gc", help="同步索引并清理已不存在的 venv 记录")
+    p_ig.add_argument("venv_path", nargs="?", default=None,
+                      help="指定 venv 路径（默认全部）")
     p_ig.add_argument("-v", "--verbose", action="store_true",
+                      help="显示每个 venv 的同步详情（默认隐藏）")
+
+    # gc（缓存垃圾回收）
+    p_gc = sub.add_parser("gc", help="清理完全孤立包名对应的缓存")
+    p_gc.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
+    p_gc.add_argument("--rebuild", action="store_true",
+                      help="清理有旧版本记录的包，并重建仍在使用的版本缓存")
+    p_gc.add_argument("-v", "--verbose", action="store_true",
                       help="显示每个 venv 的同步详情（默认隐藏）")
 
     # db
@@ -143,7 +149,7 @@ def _cmd_remove(args) -> int:
     conn = get_connection()
     if remove_venv(conn, path):
         print(f"已移除 venv: {path}")
-        print("提示: 可运行 uv-mgr index gc 清理对应的孤立缓存包")
+        print("提示: 可运行 uv-mgr gc 清理对应的孤立缓存包")
     else:
         print(f"未找到已注册的 venv: {path}")
         record_operation(conn, "venv_removed", success=False, venv_path=path,
@@ -199,10 +205,27 @@ def _cmd_sync(args) -> int:
         if args.venv_path:
             success = sync_venv(
                 conn, os.path.abspath(args.venv_path),
-                auto_register=True, prune=args.prune, verbose=args.verbose,
+                auto_register=True, verbose=args.verbose,
             )
         else:
-            success = sync_all(conn, auto_discover=True, prune=args.prune,
+            success = sync_all(conn, auto_discover=True,
+                               verbose=args.verbose)
+        return 0 if success else 1
+    finally:
+        conn.close()
+
+
+def _cmd_index_gc(args) -> int:
+    """同步全部索引，并移除已不存在的 venv 记录。"""
+    conn = get_connection()
+    try:
+        if args.venv_path:
+            success = sync_venv(
+                conn, os.path.abspath(args.venv_path), auto_register=True,
+                prune=True, verbose=args.verbose,
+            )
+        else:
+            success = sync_all(conn, auto_discover=True, prune=True,
                                verbose=args.verbose)
         return 0 if success else 1
     finally:
@@ -210,7 +233,7 @@ def _cmd_sync(args) -> int:
 
 
 def _cmd_gc(args) -> int:
-    return gc(dry_run=args.dry_run, verbose=args.verbose,
+    return clean_cache(dry_run=args.dry_run, verbose=args.verbose,
               rebuild=getattr(args, "rebuild", False))
 
 
@@ -324,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
                     case "sync":
                         return _cmd_sync(parsed)
                     case "gc":
-                        return _cmd_gc(parsed)
+                        return _cmd_index_gc(parsed)
                     case _:
                         print("用法: uv-mgr index <subcommand> ...\n")
                         print("可用的子命令:")
@@ -332,10 +355,12 @@ def main(argv: list[str] | None = None) -> int:
                         print("  remove    取消注册一个 venv")
                         print("  list      查询索引状态")
                         print("  sync      同步 venv 包状态到索引")
-                        print("  gc        清理完全孤立包名对应的缓存")
+                        print("  gc        同步索引并清理已不存在的 venv 记录")
                         return 0
             case "db":
                 return _cmd_db(parsed)
+            case "gc":
+                return _cmd_gc(parsed)
             case _:
                 parser.print_help()
                 return 0
