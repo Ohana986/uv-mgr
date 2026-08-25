@@ -99,9 +99,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gc = sub.add_parser("gc", help="清理完全孤立包名对应的缓存")
     p_gc.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
     p_gc.add_argument("--rebuild", action="store_true",
-                      help="清理有旧版本记录的包，并重建仍在使用的版本缓存")
-    p_gc.add_argument("-v", "--verbose", action="store_true",
-                      help="显示每个 venv 的同步详情（默认隐藏）")
+                      help="一次清理候选包缓存，并在原环境中恢复")
+    p_gc.add_argument("--retry", action="store_true",
+                      help="重试上次重建失败的环境（必须与 --rebuild 一起使用）")
 
     # db
     p_db = sub.add_parser("db", help="数据库管理")
@@ -205,10 +205,12 @@ def _cmd_sync(args) -> int:
         if args.venv_path:
             success = sync_venv(
                 conn, os.path.abspath(args.venv_path),
-                auto_register=True, verbose=args.verbose,
+                auto_register=True, prune=getattr(args, "prune", False),
+                verbose=args.verbose,
             )
         else:
             success = sync_all(conn, auto_discover=True,
+                               prune=getattr(args, "prune", False),
                                verbose=args.verbose)
         return 0 if success else 1
     finally:
@@ -233,8 +235,13 @@ def _cmd_index_gc(args) -> int:
 
 
 def _cmd_gc(args) -> int:
-    return clean_cache(dry_run=args.dry_run, verbose=args.verbose,
-              rebuild=getattr(args, "rebuild", False))
+    if args.retry and not args.rebuild:
+        print("错误: --retry 必须与 --rebuild 一起使用", file=sys.stderr)
+        return 2
+    if args.retry and args.dry_run:
+        print("错误: --retry 不能与 --dry-run 一起使用", file=sys.stderr)
+        return 2
+    return clean_cache(dry_run=args.dry_run, rebuild=args.rebuild, retry=args.retry)
 
 
 def _cmd_db(args) -> int:

@@ -88,7 +88,7 @@ uv-mgr index sync --verbose
 ```
 
 > 同步成功的"已同步"详情默认隐藏。需要查看时加 `-v` / `--verbose`：
-> `uv-mgr -v <uv 命令>`（透传 uv 后）或 `uv-mgr index sync -v`、`uv-mgr index gc -v`、`uv-mgr gc -v`。
+> `uv-mgr -v <uv 命令>`（透传 uv 后）或 `uv-mgr index sync -v`、`uv-mgr index gc -v`。
 
 **垃圾回收**
 
@@ -99,8 +99,11 @@ uv-mgr gc --dry-run
 # 执行清理：调用 uv cache clean <pkg> 删除孤立缓存
 uv-mgr gc
 
-# 同时处理有旧版本记录的在用包：清空包名缓存后，以临时项目重建当前版本
+# 同时处理有旧版本记录的在用包：一次清空候选缓存，并在原项目或 tool 环境恢复
 uv-mgr gc --rebuild
+
+# 只重试上次恢复失败的环境；不会再次清理缓存
+uv-mgr gc --rebuild --retry
 ```
 
 ### 数据库信息
@@ -147,7 +150,7 @@ uv-mgr db history --snapshots --venv /path/to/venv
 - **历史记录清理**：每次 venv 成功同步后，自动删除“未被引用但同名其他版本仍在使用”的数据库历史版本；完全没有版本被引用的包记录会保留给 GC 判断
 - **分离原则**：`index sync` 只更新索引，`index gc` 在同步时清理失效 venv 记录，只有 `gc` 才执行物理缓存删除——给用户反悔空间
 - **预览模式**：`--dry-run` 可查看影响范围后再执行
-- **旧版本重建**：`uv-mgr gc --rebuild` 只处理同步历史中出现过旧版本、且当前仍有版本被 venv 使用的包。它先执行 `uv cache clean <包名>`，再在 `/tmp` 的临时项目中逐个 `uv add 包名==当前版本`，以重新填充缓存。成功重建后，在没有再次清理同名缓存前不会重复处理；同一包名再次重建时会使旧成功记录失效。重建失败会记录下来，下次运行同一命令会重试。
+- **旧版本重建**：`uv-mgr gc --rebuild` 只处理同步历史中出现过旧版本、且当前仍有版本被引用的包名。它将全部候选包名交给一次 `uv cache clean <包名1> <包名2> ...`，再在受影响项目的原目录执行 `uv-mgr sync`，从而使用该项目自己的锁文件和 Python 版本恢复缓存。可从 `uv-receipt.toml` 安全识别来源的 uv tool 会以原 requirements、Python 和链接模式执行 `uv tool install --force`；无法安全重放的环境会被跳过且相关包缓存不会清理。恢复失败按环境记录，可用 `uv-mgr gc --rebuild --retry` 单独重试，不会再次清缓存。
 
 数据库索引记录的是各 venv 的最终安装清单，不等同于 uv 的全量缓存。缓存中未被索引的构建依赖或下载包不会被自动判定为垃圾；数据库中没有对应缓存的历史记录也不会直接触发缓存删除。
 

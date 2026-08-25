@@ -198,28 +198,42 @@ class TestSyncCommand:
 class TestGcCommand:
     def test_gc(self, monkeypatch):
         """#60 gc → 执行清理（dry_run=False）。"""
-        with patch("uv_mgr.cli.gc") as mock:
+        with patch("uv_mgr.cli.clean_cache") as mock:
             from uv_mgr.cli import _cmd_gc
-            args = MagicMock(dry_run=False, verbose=False, rebuild=False)
+            args = MagicMock(dry_run=False, rebuild=False, retry=False)
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=False, verbose=False, rebuild=False)
+        mock.assert_called_once_with(dry_run=False, rebuild=False, retry=False)
 
     def test_gc_dry_run(self, monkeypatch):
         """#61 gc --dry-run → 预览模式。"""
-        with patch("uv_mgr.cli.gc") as mock:
+        with patch("uv_mgr.cli.clean_cache") as mock:
             from uv_mgr.cli import _cmd_gc
-            args = MagicMock(dry_run=True, verbose=False, rebuild=False)
+            args = MagicMock(dry_run=True, rebuild=False, retry=False)
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=True, verbose=False, rebuild=False)
+        mock.assert_called_once_with(dry_run=True, rebuild=False, retry=False)
 
     def test_gc_rebuild(self, monkeypatch):
         """gc --rebuild → 启用按当前版本重建缓存。"""
         from uv_mgr.cli import _build_parser, _cmd_gc
 
-        with patch("uv_mgr.cli.gc") as mock:
-            args = _build_parser().parse_args(["index", "gc", "--rebuild"])
+        with patch("uv_mgr.cli.clean_cache") as mock:
+            args = _build_parser().parse_args(["gc", "--rebuild"])
             _cmd_gc(args)
-        mock.assert_called_once_with(dry_run=False, verbose=False, rebuild=True)
+        mock.assert_called_once_with(dry_run=False, rebuild=True, retry=False)
+
+    def test_retry_requires_rebuild(self, capsys):
+        from uv_mgr.cli import _build_parser, _cmd_gc
+
+        args = _build_parser().parse_args(["gc", "--retry"])
+        assert _cmd_gc(args) == 2
+        assert "必须与 --rebuild" in capsys.readouterr().err
+
+    def test_retry_cannot_be_dry_run(self, capsys):
+        from uv_mgr.cli import _build_parser, _cmd_gc
+
+        args = _build_parser().parse_args(["gc", "--rebuild", "--retry", "--dry-run"])
+        assert _cmd_gc(args) == 2
+        assert "不能与 --dry-run" in capsys.readouterr().err
 
 
 # ── #62 db ─────────────────────────────────────────────────────────
