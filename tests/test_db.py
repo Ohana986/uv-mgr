@@ -20,7 +20,13 @@ from uv_mgr.db import (
     get_venv_packages,
     get_orphan_packages,
     remove_orphan_packages,
+    normalize_package_name,
+    prune_historical_orphan_packages,
     get_stats,
+    record_sync_history,
+    get_package_events,
+    get_snapshots,
+    get_snapshot_packages,
 )
 
 
@@ -53,6 +59,43 @@ class TestInitDb:
         init_db(conn)
         venvs = list_venvs(conn)
         assert len(venvs) == 1
+
+    def test_migrate_v2_to_v3_normalizes_and_merges_packages(self, conn):
+        v = add_venv(conn, "/tmp/venv")
+        conn.execute("UPDATE _meta SET value = '2' WHERE key = 'schema_version'")
+        conn.execute("INSERT INTO packages (name, version) VALUES ('Spire.Doc_Free', '1.0')")
+        first = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("INSERT INTO packages (name, version) VALUES ('spire-doc-free', '1.0')")
+        second = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO venv_packages (venv_id, package_id) VALUES (?, ?)",
+            (v, second),
+        )
+        conn.commit()
+
+        init_db(conn)
+
+        packages = conn.execute("SELECT id, name FROM packages").fetchall()
+        assert [(row["id"], row["name"]) for row in packages] == [
+            (first, "spire-doc-free"),
+        ]
+        links = conn.execute("SELECT package_id FROM venv_packages").fetchall()
+        assert [row["package_id"] for row in links] == [first]
+        assert conn.execute(
+            "SELECT value FROM _meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
+
+    def test_migrate_v3_to_v4_creates_history_tables(self, conn):
+        conn.execute("UPDATE _meta SET value = '3' WHERE key = 'schema_version'")
+        conn.commit()
+        init_db(conn)
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        assert {"operations", "sync_snapshots", "snapshot_packages", "package_events"} <= tables
+        assert conn.execute(
+            "SELECT value FROM _meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "4"
 
 
 # ── #3~9 Venv CRUD ────────────────────────────────────────────────
@@ -113,6 +156,13 @@ class TestVenvCrud:
 # ── #10~13 Package CRUD ────────────────────────────────────────────
 
 class TestPackageCrud:
+    @pytest.mark.parametrize(("raw_name", "expected"), [
+        ("Spire.Doc_Free", "spire-doc-free"),
+        ("foo---bar__baz..qux", "foo-bar-baz-qux"),
+    ])
+    def test_normalize_package_name(self, raw_name, expected):
+        assert normalize_package_name(raw_name) == expected
+
     def test_ensure_new_package(self, conn):
         """#10 新包 INSERT，返回新 ID。"""
         pid = ensure_package(conn, "requests", "2.31.0")
@@ -140,6 +190,12 @@ class TestPackageCrud:
         p2 = ensure_package(conn, "foo", "2.0")
         assert p1 != p2
 
+    def test_name_variants_share_one_package_record(self, conn):
+        p1 = ensure_package(conn, "Spire.Doc_Free", "1.0")
+        p2 = ensure_package(conn, "spire-doc-free", "1.0")
+        assert p1 == p2
+        assert conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0] == 1
+
 
 class TestReplaceVenvPackages:
     def test_replace_linked(self, conn):
@@ -162,6 +218,48 @@ class TestReplaceVenvPackages:
         replace_venv_packages(conn, v, [p1])
         replace_venv_packages(conn, v, [])
         assert get_venv_packages(conn, v) == []
+
+
+class TestHistory:
+    def test_snapshots_and_events_cover_lifecycle(self, conn):
+        path = "/tmp/history-venv"
+        record_sync_history(conn, path, "3.11", [("foo", "1.0"), ("bar", "1.0")])
+        record_sync_history(conn, path, "3.11", [("foo", "2.0"), ("baz", "1.0")])
+        record_sync_history(conn, path, "3.11", [("foo", "1.5"), ("baz", "1.0")])
+        record_sync_history(conn, path, "3.11", [("foo", "1.5"), ("baz", "1.0")])
+
+        snapshots = get_snapshots(conn, venv_path=path)
+        assert len(snapshots) == 4
+        assert len(get_snapshot_packages(conn, snapshots[0]["id"])) == 2
+        events = get_package_events(conn, venv_path=path, limit=20)
+        assert [event["event_type"] for event in events].count("installed") == 3
+        assert [event["event_type"] for event in events].count("removed") == 1
+        assert [event["event_type"] for event in events].count("upgraded") == 1
+        assert [event["event_type"] for event in events].count("downgraded") == 1
+
+    def test_history_package_filter_normalizes_name(self, conn):
+        record_sync_history(conn, "/tmp/history-venv", None,
+                            [("Spire.Doc_Free", "1.0")])
+        events = get_package_events(conn, package_name="spire_doc_free")
+        snapshots = get_snapshots(conn, package_name="spire-doc-free")
+        assert len(events) == 1
+        assert len(snapshots) == 1
+
+    def test_prerelease_to_final_is_neutral_version_change(self, conn):
+        path = "/tmp/history-venv"
+        record_sync_history(conn, path, None, [("foo", "1.0rc1")])
+        record_sync_history(conn, path, None, [("foo", "1.0")])
+
+        events = get_package_events(conn, venv_path=path, limit=10)
+        assert events[0]["event_type"] == "changed"
+
+    def test_removing_venv_preserves_history(self, conn):
+        path = "/tmp/history-venv"
+        v = add_venv(conn, path)
+        record_sync_history(conn, path, None, [("foo", "1.0")])
+        remove_venv(conn, path)
+        assert get_snapshots(conn, venv_path=path)[0]["venv_path"] == path
+        assert v > 0
 
 
 # ── #14~21 查询 ─────────────────────────────────────────────────────
@@ -225,6 +323,35 @@ class TestQueries:
         ids = [r["id"] for r in rows]
         assert p1 not in ids
         assert p2 in ids
+
+    def test_prune_historical_orphan_keeps_fully_orphaned_package(self, conn):
+        v = add_venv(conn, "/tmp/venv")
+        current = ensure_package(conn, "foo", "2.0")
+        old = ensure_package(conn, "foo", "1.0")
+        fully_orphaned = ensure_package(conn, "bar", "1.0")
+        replace_venv_packages(conn, v, [current])
+
+        assert prune_historical_orphan_packages(conn) == 1
+        ids = {row["id"] for row in conn.execute("SELECT id FROM packages")}
+        assert old not in ids
+        assert current in ids
+        assert fully_orphaned in ids
+
+    def test_prune_historical_orphan_keeps_shared_current_version(self, conn):
+        v1 = add_venv(conn, "/tmp/venv-a")
+        v2 = add_venv(conn, "/tmp/venv-b")
+        current = ensure_package(conn, "foo", "2.0")
+        old = ensure_package(conn, "foo", "1.0")
+        replace_venv_packages(conn, v1, [current])
+        replace_venv_packages(conn, v2, [current])
+
+        prune_historical_orphan_packages(conn)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM packages WHERE id = ?", (current,)
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM packages WHERE id = ?", (old,)
+        ).fetchone()[0] == 0
 
     def test_db_path(self):
         """#20 数据库路径指向 ~/.local/share/uv-mgr/index.db。"""

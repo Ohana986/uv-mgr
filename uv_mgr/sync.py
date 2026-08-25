@@ -15,6 +15,9 @@ from uv_mgr.db import (
     get_venv_by_path,
     ensure_package,
     replace_venv_packages,
+    prune_historical_orphan_packages,
+    record_operation,
+    record_sync_history,
     list_venvs,
     get_venvs_by_source,
 )
@@ -143,9 +146,13 @@ def sync_venv(conn, venv_path: str, *,
     if venv is None:
         if not auto_register:
             print(f"未注册的 venv: {venv_path}，请先运行 uv-mgr index add {venv_path}")
+            record_operation(conn, "sync", success=False, venv_path=venv_path,
+                             error="venv 未注册")
             return False
         if not os.path.isdir(venv_path):
             print(f"错误: venv 目录不存在: {venv_path}", file=sys.stderr)
+            record_operation(conn, "sync", success=False, venv_path=venv_path,
+                             error="venv 目录不存在")
             return False
         add_venv(conn, venv_path, source=source)
         venv = get_venv_by_path(conn, venv_path)
@@ -158,12 +165,16 @@ def sync_venv(conn, venv_path: str, *,
             print(f"已清理失效记录: {venv_path}")
         else:
             print("提示: 使用 --prune 自动清理失效记录", file=sys.stderr)
+        record_operation(conn, "sync", success=False, venv_path=venv_path,
+                         error="venv 目录不存在")
         return False
 
     # 找 python 解释器
     python_path = venv_python_path(venv_path)
     if python_path is None:
         print(f"警告: 未找到 Python 解释器: {venv_path}/bin/python（Windows 可使用 Scripts/python.exe）", file=sys.stderr)
+        record_operation(conn, "sync", success=False, venv_path=venv_path,
+                         error="未找到 Python 解释器")
         return False
 
     # 获取并记录 Python 版本
@@ -186,6 +197,8 @@ def sync_venv(conn, venv_path: str, *,
     packages, success = scan_result
     if not success:
         print(f"警告: 扫描失败，保留 {venv_path} 的现有索引记录。", file=sys.stderr)
+        record_operation(conn, "sync", success=False, venv_path=venv_path,
+                         error="扫描 venv 包列表失败")
         return False
     if not packages:
         if verbose:
@@ -195,6 +208,8 @@ def sync_venv(conn, venv_path: str, *,
         if python_version:
             conn.execute("UPDATE venvs SET python_version = ? WHERE id = ?", (python_version, venv["id"]))
             conn.commit()
+        prune_historical_orphan_packages(conn)
+        record_sync_history(conn, venv_path, python_version, packages)
         if verbose:
             print(f"已同步: {venv_path}（0 个包）")
         return True
@@ -207,6 +222,8 @@ def sync_venv(conn, venv_path: str, *,
     if python_version:
         conn.execute("UPDATE venvs SET python_version = ? WHERE id = ?", (python_version, venv["id"]))
         conn.commit()
+    prune_historical_orphan_packages(conn)
+    record_sync_history(conn, venv_path, python_version, packages)
     if verbose:
         print(f"已同步: {venv_path}（{len(packages)} 个包）")
     return True

@@ -127,7 +127,7 @@ class TestListCommand:
         out = capsys.readouterr().out
         assert "已注册 venv" in out
         assert "已索引包" in out
-        assert "孤立包" in out
+        assert "未引用包记录" in out
 
     def test_list_venvs_only(self, conn, capsys, monkeypatch):
         """#54 list --venvs 只显示 venvs。"""
@@ -156,7 +156,7 @@ class TestListCommand:
         args = MagicMock(venvs=False, packages=False, orphans=True, type=None)
         _cmd_list(args)
         out = capsys.readouterr().out
-        assert "孤立包" in out
+        assert "未引用包记录" in out
 
     def test_list_empty(self, conn, capsys, monkeypatch):
         """#57 无数据 → 显示 0。"""
@@ -226,6 +226,35 @@ class TestDbCommand:
         assert "Schema 版本" in out
         assert "已注册 venv" in out
         assert "已索引包" in out
+
+    def test_db_history_events(self, conn, capsys, monkeypatch):
+        from uv_mgr.db import record_sync_history
+        record_sync_history(conn, "/tmp/history-venv", None, [("foo", "1.0")])
+        monkeypatch.setattr("uv_mgr.cli.get_connection", lambda: conn)
+        from uv_mgr.cli import _cmd_db
+        args = MagicMock(
+            db_action="history", history_venv=None, history_package="foo",
+            limit=50, events=True, snapshots=False,
+        )
+        assert _cmd_db(args) == 0
+        out = capsys.readouterr().out
+        assert "包变更事件" in out
+        assert "安装" in out
+        assert "foo" in out
+
+    def test_db_history_snapshots(self, conn, capsys, monkeypatch):
+        from uv_mgr.db import record_sync_history
+        record_sync_history(conn, "/tmp/history-venv", "3.11", [("foo", "1.0")])
+        monkeypatch.setattr("uv_mgr.cli.get_connection", lambda: conn)
+        from uv_mgr.cli import _cmd_db
+        args = MagicMock(
+            db_action="history", history_venv="/tmp/history-venv",
+            history_package=None, limit=50, events=False, snapshots=True,
+        )
+        assert _cmd_db(args) == 0
+        out = capsys.readouterr().out
+        assert "同步快照" in out
+        assert "foo==1.0" in out
 
 
 # ── #63~67 透传路由 ───────────────────────────────────────────────

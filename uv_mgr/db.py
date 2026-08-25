@@ -1,11 +1,12 @@
 """SQLite 数据库层：建表、迁移、CRUD。"""
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 DB_DIR = Path.home() / ".local" / "share" / "uv-mgr"
 DB_PATH = DB_DIR / "index.db"
@@ -58,6 +59,49 @@ CREATE TABLE IF NOT EXISTS venv_packages (
 
 CREATE INDEX IF NOT EXISTS idx_venv_packages_package
     ON venv_packages(package_id);
+
+CREATE TABLE IF NOT EXISTS operations (
+    id             INTEGER PRIMARY KEY,
+    occurred_at    TEXT NOT NULL,
+    operation_type TEXT NOT NULL,
+    success        INTEGER NOT NULL,
+    venv_path      TEXT,
+    summary        TEXT NOT NULL DEFAULT '',
+    error          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sync_snapshots (
+    id             INTEGER PRIMARY KEY,
+    venv_path      TEXT NOT NULL,
+    python_version TEXT,
+    occurred_at    TEXT NOT NULL,
+    operation_id   INTEGER REFERENCES operations(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_packages (
+    snapshot_id INTEGER NOT NULL REFERENCES sync_snapshots(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    version     TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS package_events (
+    id          INTEGER PRIMARY KEY,
+    venv_path   TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    old_version TEXT,
+    new_version TEXT,
+    snapshot_id INTEGER REFERENCES sync_snapshots(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operations_venv_time
+    ON operations(venv_path, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_snapshots_venv_time
+    ON sync_snapshots(venv_path, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_package_events_name_time
+    ON package_events(name, occurred_at DESC);
 """
 
 
@@ -79,6 +123,56 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     print("数据库迁移: v1 → v2（venvs 表新增 source 列，已分类现有记录）")
 
 
+def normalize_package_name(name: str) -> str:
+    """按 PEP 503 规则规范化 Python 发行包名称。"""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """统一包名，并合并规范化后重复的包版本记录。"""
+    rows = conn.execute(
+        "SELECT id, name, version FROM packages ORDER BY id"
+    ).fetchall()
+    groups: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        groups.setdefault(
+            (normalize_package_name(row["name"]), row["version"]), []
+        ).append(row["id"])
+
+    # 先转移关联、删除重复行，避免更新名称时触发 UNIQUE(name, version)。
+    for _key, ids in groups.items():
+        retained_id, *duplicate_ids = ids
+        for duplicate_id in duplicate_ids:
+            conn.execute(
+                """INSERT OR IGNORE INTO venv_packages (venv_id, package_id, installed_at)
+                   SELECT venv_id, ?, installed_at
+                   FROM venv_packages WHERE package_id = ?""",
+                (retained_id, duplicate_id),
+            )
+            conn.execute("DELETE FROM packages WHERE id = ?", (duplicate_id,))
+
+    # 重复项已移除，逐行更新不会再违反唯一约束。
+    for (normalized_name, version), ids in groups.items():
+        conn.execute(
+            "UPDATE packages SET name = ? WHERE id = ? AND version = ?",
+            (normalized_name, ids[0], version),
+        )
+    conn.execute(
+        "UPDATE _meta SET value = '3' WHERE key = 'schema_version'"
+    )
+    conn.commit()
+    print("数据库迁移: v2 → v3（已按 PEP 503 规范化包名并合并重复记录）")
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """启用操作审计、同步快照与包变更历史。"""
+    conn.execute(
+        "UPDATE _meta SET value = '4' WHERE key = 'schema_version'"
+    )
+    conn.commit()
+    print("数据库迁移: v3 → v4（已启用操作审计与包版本历史）")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     cur = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'")
@@ -92,6 +186,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         version = int(row[0])
         if version < 2:
             _migrate_v1_to_v2(conn)
+            version = 2
+        if version < 3:
+            _migrate_v2_to_v3(conn)
+            version = 3
+        if version < 4:
+            _migrate_v3_to_v4(conn)
         elif version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"数据库 schema 版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}，"
@@ -105,6 +205,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
     now = datetime.now(timezone.utc).isoformat()
     name = os.path.basename(os.path.normpath(path))
+    existing = get_venv_by_path(conn, path)
     conn.execute(
         """INSERT OR IGNORE INTO venvs (path, name, source, created_at)
            VALUES (?, ?, ?, ?)""",
@@ -112,12 +213,20 @@ def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
     )
     conn.commit()
     row = conn.execute("SELECT id FROM venvs WHERE path = ?", (path,)).fetchone()
+    if existing is None:
+        record_operation(
+            conn, "venv_added", venv_path=path,
+            summary=f"已注册 venv（来源: {source}）",
+        )
     return row["id"]
 
 
 def remove_venv(conn: sqlite3.Connection, path: str) -> bool:
     cur = conn.execute("DELETE FROM venvs WHERE path = ?", (path,))
     conn.commit()
+    if cur.rowcount > 0:
+        record_operation(conn, "venv_removed", venv_path=path,
+                         summary="已取消注册 venv")
     return cur.rowcount > 0
 
 
@@ -142,6 +251,7 @@ def get_venv_by_path(conn: sqlite3.Connection, path: str):
 # ── Package CRUD ────────────────────────────────────────────────────
 
 def ensure_package(conn: sqlite3.Connection, name: str, version: str) -> int:
+    name = normalize_package_name(name)
     conn.execute(
         """INSERT OR IGNORE INTO packages (name, version) VALUES (?, ?)""",
         (name, version),
@@ -172,6 +282,201 @@ def replace_venv_packages(
         (datetime.now(timezone.utc).isoformat(), venv_id),
     )
     conn.commit()
+
+
+def prune_historical_orphan_packages(conn: sqlite3.Connection) -> int:
+    """删除同名包仍有在用版本时遗留的未引用历史版本记录。
+
+    完全没有版本被引用的包会保留，供 GC 按包名安全处理。
+    """
+    cur = conn.execute(
+        """DELETE FROM packages AS old
+           WHERE NOT EXISTS (
+               SELECT 1 FROM venv_packages AS old_link
+               WHERE old_link.package_id = old.id
+           )
+           AND EXISTS (
+               SELECT 1
+               FROM packages AS current
+               JOIN venv_packages AS current_link
+                 ON current_link.package_id = current.id
+               WHERE current.name = old.name
+           )"""
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+# ── 操作与包版本历史 ───────────────────────────────────────────────
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_operation(
+    conn: sqlite3.Connection, operation_type: str, *, success: bool = True,
+    venv_path: str | None = None, summary: str = "", error: str | None = None,
+    occurred_at: str | None = None,
+) -> int:
+    """写入一条独立于当前索引的内部操作审计记录。"""
+    cur = conn.execute(
+        """INSERT INTO operations
+           (occurred_at, operation_type, success, venv_path, summary, error)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (occurred_at or _now(), operation_type, int(success), venv_path,
+         summary, error),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _compare_simple_versions(old: str, new: str) -> int | None:
+    """比较仅含数字和点的版本；其他 PEP 440 形式返回 None。
+
+    项目不引入外部依赖，标准库也没有 PEP 440 解析器。预发布、开发版和
+    本地版本等形式若强行按字符串拆分会产生错误的升级/降级结论，因此由
+    调用方将其记录为中性的版本变更。
+    """
+    if not re.fullmatch(r"\d+(?:\.\d+)*", old) or not re.fullmatch(
+        r"\d+(?:\.\d+)*", new
+    ):
+        return None
+
+    def parts(version: str) -> tuple[int, ...]:
+        values = [int(part) for part in version.split(".")]
+        while len(values) > 1 and values[-1] == 0:
+            values.pop()
+        return tuple(values)
+
+    old_parts, new_parts = parts(old), parts(new)
+    if new_parts > old_parts:
+        return 1
+    if new_parts < old_parts:
+        return -1
+    return 0
+
+
+def record_sync_history(
+    conn: sqlite3.Connection, venv_path: str, python_version: str | None,
+    packages: list[tuple[str, str]],
+) -> int:
+    """保存成功同步的完整快照，并记录相对前一快照的包变更。"""
+    now = _now()
+    current = {normalize_package_name(name): version for name, version in packages}
+    previous_snapshot = conn.execute(
+        """SELECT id FROM sync_snapshots WHERE venv_path = ?
+           ORDER BY occurred_at DESC, id DESC LIMIT 1""",
+        (venv_path,),
+    ).fetchone()
+    previous: dict[str, str] = {}
+    if previous_snapshot is not None:
+        previous = {
+            row["name"]: row["version"]
+            for row in conn.execute(
+                "SELECT name, version FROM snapshot_packages WHERE snapshot_id = ?",
+                (previous_snapshot["id"],),
+            ).fetchall()
+        }
+
+    operation_id = record_operation(
+        conn, "sync", venv_path=venv_path,
+        summary=f"同步成功（{len(current)} 个包）", occurred_at=now,
+    )
+    cur = conn.execute(
+        """INSERT INTO sync_snapshots
+           (venv_path, python_version, occurred_at, operation_id)
+           VALUES (?, ?, ?, ?)""",
+        (venv_path, python_version, now, operation_id),
+    )
+    snapshot_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO snapshot_packages (snapshot_id, name, version) VALUES (?, ?, ?)",
+        [(snapshot_id, name, version) for name, version in current.items()],
+    )
+
+    events: list[tuple[str, str, str | None, str | None]] = []
+    for name in sorted(current.keys() - previous.keys()):
+        events.append(("installed", name, None, current[name]))
+    for name in sorted(previous.keys() - current.keys()):
+        events.append(("removed", name, previous[name], None))
+    for name in sorted(current.keys() & previous.keys()):
+        old_version, new_version = previous[name], current[name]
+        if old_version == new_version:
+            continue
+        comparison = _compare_simple_versions(old_version, new_version)
+        if comparison is None or comparison == 0:
+            event_type = "changed"
+        elif comparison > 0:
+            event_type = "upgraded"
+        else:
+            event_type = "downgraded"
+        events.append((event_type, name, old_version, new_version))
+    conn.executemany(
+        """INSERT INTO package_events
+           (venv_path, occurred_at, event_type, name, old_version, new_version, snapshot_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [(venv_path, now, event_type, name, old, new, snapshot_id)
+         for event_type, name, old, new in events],
+    )
+    conn.commit()
+    return snapshot_id
+
+
+def get_operations(conn: sqlite3.Connection, *, venv_path: str | None = None,
+                   limit: int = 50) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM operations"
+    params: list[object] = []
+    if venv_path:
+        sql += " WHERE venv_path = ?"
+        params.append(venv_path)
+    sql += " ORDER BY occurred_at DESC, id DESC LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def get_package_events(conn: sqlite3.Connection, *, venv_path: str | None = None,
+                       package_name: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if venv_path:
+        clauses.append("venv_path = ?")
+        params.append(venv_path)
+    if package_name:
+        clauses.append("name = ?")
+        params.append(normalize_package_name(package_name))
+    sql = "SELECT * FROM package_events"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY occurred_at DESC, id DESC LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def get_snapshots(conn: sqlite3.Connection, *, venv_path: str | None = None,
+                  package_name: str | None = None, limit: int = 50) -> list[sqlite3.Row]:
+    params: list[object] = []
+    sql = "SELECT s.* FROM sync_snapshots s"
+    if package_name:
+        sql += " JOIN snapshot_packages p ON p.snapshot_id = s.id"
+    clauses: list[str] = []
+    if venv_path:
+        clauses.append("s.venv_path = ?")
+        params.append(venv_path)
+    if package_name:
+        clauses.append("p.name = ?")
+        params.append(normalize_package_name(package_name))
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY s.occurred_at DESC, s.id DESC LIMIT ?"
+    params.append(limit)
+    return conn.execute(sql, params).fetchall()
+
+
+def get_snapshot_packages(conn: sqlite3.Connection, snapshot_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT name, version FROM snapshot_packages WHERE snapshot_id = ? ORDER BY name",
+        (snapshot_id,),
+    ).fetchall()
 
 
 # ── 查询 ────────────────────────────────────────────────────────────

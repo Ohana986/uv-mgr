@@ -16,6 +16,11 @@ from uv_mgr.db import (
     get_venvs_by_source,
     get_orphan_packages,
     get_stats,
+    get_operations,
+    get_package_events,
+    get_snapshots,
+    get_snapshot_packages,
+    record_operation,
 )
 from uv_mgr.sync import (
     should_sync_after_uv,
@@ -73,7 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_il.add_argument("--type", choices=['user', 'auto', 'tool'], default=None,
                       help="按来源过滤 venv（user/auto/tool）")
     p_il.add_argument("--packages", action="store_true", help="列出所有已索引包")
-    p_il.add_argument("--orphans", action="store_true", help="列出孤立包")
+    p_il.add_argument("--orphans", action="store_true",
+                      help="列出未被 venv 引用的数据库包记录")
 
     # index sync
     p_is = idx_sub.add_parser("sync", help="同步 venv 包状态到索引")
@@ -84,7 +90,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="显示每个 venv 的同步详情（默认隐藏）")
 
     # index gc
-    p_ig = idx_sub.add_parser("gc", help="清理孤立缓存包")
+    p_ig = idx_sub.add_parser("gc", help="清理完全孤立包名对应的缓存")
     p_ig.add_argument("--dry-run", action="store_true", help="预览模式，不实际清理")
     p_ig.add_argument("-v", "--verbose", action="store_true",
                       help="显示每个 venv 的同步详情（默认隐藏）")
@@ -92,7 +98,13 @@ def _build_parser() -> argparse.ArgumentParser:
     # db
     p_db = sub.add_parser("db", help="数据库管理")
     p_db.add_argument("db_action", nargs="?", default="info",
-                      choices=["info"], help="操作（默认 info）")
+                      choices=["info", "history"], help="操作（默认 info）")
+    p_db.add_argument("--venv", dest="history_venv", help="按 venv 路径筛选历史")
+    p_db.add_argument("--package", dest="history_package", help="按包名筛选历史")
+    p_db.add_argument("--limit", type=int, default=50, help="最多显示记录数（默认 50）")
+    history_view = p_db.add_mutually_exclusive_group()
+    history_view.add_argument("--events", action="store_true", help="显示包变更事件")
+    history_view.add_argument("--snapshots", action="store_true", help="显示同步快照及包清单")
 
     return parser
 
@@ -101,9 +113,21 @@ def _cmd_add(args) -> int:
     path = os.path.abspath(args.venv_path)
     if not os.path.isdir(path):
         print(f"错误: 目录不存在: {path}", file=sys.stderr)
+        conn = get_connection()
+        try:
+            record_operation(conn, "venv_added", success=False, venv_path=path,
+                             error="venv 目录不存在")
+        finally:
+            conn.close()
         return 1
     if venv_python_path(path) is None:
         print(f"错误: 不是有效的 venv（未找到 Python 解释器: {path}/bin/python 或 {path}/Scripts/python.exe）", file=sys.stderr)
+        conn = get_connection()
+        try:
+            record_operation(conn, "venv_added", success=False, venv_path=path,
+                             error="未找到 Python 解释器")
+        finally:
+            conn.close()
         return 1
     conn = get_connection()
     add_venv(conn, path)
@@ -120,6 +144,8 @@ def _cmd_remove(args) -> int:
         print("提示: 可运行 uv-mgr index gc 清理对应的孤立缓存包")
     else:
         print(f"未找到已注册的 venv: {path}")
+        record_operation(conn, "venv_removed", success=False, venv_path=path,
+                         error="venv 未注册")
         conn.close()
         return 1
     conn.close()
@@ -157,7 +183,7 @@ def _cmd_list(args) -> int:
 
     if show_all or args.orphans:
         orphans = get_orphan_packages(conn)
-        print(f"\n孤立包（{len(orphans)} 个记录）：")
+        print(f"\n未引用包记录（{len(orphans)} 个）：")
         for o in orphans:
             print(f"  {o['name']}=={o['version']}")
 
@@ -187,15 +213,64 @@ def _cmd_gc(args) -> int:
 
 def _cmd_db(args) -> int:
     conn = get_connection()
-    stats = get_stats(conn)
-    print(f"数据库路径: {conn.execute('PRAGMA database_list').fetchone()[2]}")
-    row = conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
-    print(f"Schema 版本: {row[0]}")
-    print(f"已注册 venv: {stats['venvs']}")
-    print(f"已索引包: {stats['packages']}")
-    print(f"venv-包关联: {stats['venv_package_links']}")
-    print(f"孤立包: {stats['orphans']}")
-    conn.close()
+    try:
+        if args.db_action == "history":
+            return _cmd_db_history(conn, args)
+        stats = get_stats(conn)
+        print(f"数据库路径: {conn.execute('PRAGMA database_list').fetchone()[2]}")
+        row = conn.execute("SELECT value FROM _meta WHERE key='schema_version'").fetchone()
+        print(f"Schema 版本: {row[0]}")
+        print(f"已注册 venv: {stats['venvs']}")
+        print(f"已索引包: {stats['packages']}")
+        print(f"venv-包关联: {stats['venv_package_links']}")
+        print(f"未引用包记录: {stats['orphans']}")
+        print(f"历史操作: {conn.execute('SELECT COUNT(*) FROM operations').fetchone()[0]}")
+        print(f"同步快照: {conn.execute('SELECT COUNT(*) FROM sync_snapshots').fetchone()[0]}")
+        print(f"包变更事件: {conn.execute('SELECT COUNT(*) FROM package_events').fetchone()[0]}")
+        return 0
+    finally:
+        conn.close()
+
+
+def _cmd_db_history(conn, args) -> int:
+    limit = args.limit
+    if limit < 1:
+        print("错误: --limit 必须大于 0", file=sys.stderr)
+        return 1
+    venv_path = os.path.abspath(args.history_venv) if args.history_venv else None
+    package_name = args.history_package
+    if args.snapshots:
+        snapshots = get_snapshots(
+            conn, venv_path=venv_path, package_name=package_name, limit=limit,
+        )
+        print(f"同步快照（{len(snapshots)} 条）：")
+        for snapshot in snapshots:
+            py_ver = f"，Python {snapshot['python_version']}" if snapshot["python_version"] else ""
+            print(f"  {snapshot['occurred_at']}  {snapshot['venv_path']}{py_ver}")
+            for package in get_snapshot_packages(conn, snapshot["id"]):
+                print(f"    {package['name']}=={package['version']}")
+        return 0
+    if args.events or package_name:
+        events = get_package_events(
+            conn, venv_path=venv_path, package_name=package_name, limit=limit,
+        )
+        print(f"包变更事件（{len(events)} 条）：")
+        labels = {"installed": "安装", "removed": "移除", "upgraded": "升级",
+                  "downgraded": "降级", "changed": "版本变更"}
+        for event in events:
+            change = f"{event['old_version'] or '—'} → {event['new_version'] or '—'}"
+            print(f"  {event['occurred_at']}  {labels[event['event_type']]}  "
+                  f"{event['name']}  {change}  [{event['venv_path']}]")
+        return 0
+
+    operations = get_operations(conn, venv_path=venv_path, limit=limit)
+    print(f"历史操作（{len(operations)} 条）：")
+    for operation in operations:
+        result = "成功" if operation["success"] else "失败"
+        path = f"  [{operation['venv_path']}]" if operation["venv_path"] else ""
+        detail = operation["summary"] or operation["error"] or ""
+        print(f"  {operation['occurred_at']}  {operation['operation_type']}  "
+              f"{result}{path}  {detail}")
     return 0
 
 
@@ -254,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                         print("  remove    取消注册一个 venv")
                         print("  list      查询索引状态")
                         print("  sync      同步 venv 包状态到索引")
-                        print("  gc        清理孤立缓存包")
+                        print("  gc        清理完全孤立包名对应的缓存")
                         return 0
             case "db":
                 return _cmd_db(parsed)

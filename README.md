@@ -67,7 +67,7 @@ uv-mgr index list --venvs
 # 查看所有已索引包
 uv-mgr index list --packages
 
-# 查看孤立包（未被任何 venv 引用）
+# 查看数据库中未被任何 venv 引用的包记录
 uv-mgr index list --orphans
 
 # 查看全部
@@ -106,6 +106,24 @@ uv-mgr index gc
 uv-mgr db info
 ```
 
+### 操作与包版本历史
+
+```bash
+# 最近操作审计（默认最近 50 条）
+uv-mgr db history
+
+# 某个 venv 的历史操作
+uv-mgr db history --venv /path/to/venv
+
+# 包的安装、移除、升级与降级事件
+uv-mgr db history --events --package requests
+
+# 成功同步的完整包快照
+uv-mgr db history --snapshots --venv /path/to/venv
+```
+
+每次成功同步都会保存该 venv 的完整包版本快照，并与前一快照比较，记录安装、移除、升级和降级事件。注册、移除、同步失败、GC 预览和 GC 执行同样记录完成时刻。历史永久保留，独立于当前索引：移除 venv、清理当前索引的历史版本或执行 GC 都不会删除已有历史。
+
 ### 快速参考
 
 | 想做的事 | 命令 |
@@ -122,8 +140,11 @@ uv-mgr db info
 ## GC 策略
 
 - **安全优先**：仅当某个包的**所有版本**都不被任何 venv 引用时，才 `uv cache clean <pkg>`
+- **历史记录清理**：每次 venv 成功同步后，自动删除“未被引用但同名其他版本仍在使用”的数据库历史版本；完全没有版本被引用的包记录会保留给 GC 判断
 - **分离原则**：`index sync` 只更新索引，`index gc` 才执行物理删除——给用户反悔空间
 - **预览模式**：`--dry-run` 可查看影响范围后再执行
+
+数据库索引记录的是各 venv 的最终安装清单，不等同于 uv 的全量缓存。缓存中未被索引的构建依赖或下载包不会被自动判定为垃圾；数据库中没有对应缓存的历史记录也不会直接触发缓存删除。
 
 ## 环境变量
 

@@ -121,6 +121,56 @@ class TestScanVenvPackages:
 # ── #32~37 sync_venv ───────────────────────────────────────────────
 
 class TestSyncVenv:
+    def test_sync_records_snapshot_and_failure_audit(self, conn, monkeypatch):
+        from uv_mgr.db import add_venv, get_operations, get_snapshots
+
+        add_venv(conn, "/tmp/test-venv")
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+        with patch("uv_mgr.sync.scan_venv_packages", return_value=(
+            [("example-pkg", "1.0")], True,
+        )):
+            assert sync_venv(conn, "/tmp/test-venv", check_uv=False) is True
+        with patch("uv_mgr.sync.scan_venv_packages", return_value=([], False)):
+            assert sync_venv(conn, "/tmp/test-venv", check_uv=False) is False
+
+        assert len(get_snapshots(conn, venv_path="/tmp/test-venv")) == 1
+        operations = get_operations(conn, venv_path="/tmp/test-venv", limit=10)
+        assert any(row["operation_type"] == "sync" and row["success"] for row in operations)
+        assert any(row["operation_type"] == "sync" and not row["success"] for row in operations)
+
+    def test_successful_sync_prunes_old_version_records(self, conn, monkeypatch):
+        from uv_mgr.db import add_venv, ensure_package, get_orphan_packages
+
+        add_venv(conn, "/tmp/test-venv")
+        old = ensure_package(conn, "example-pkg", "1.0")
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+        with patch("uv_mgr.sync.scan_venv_packages", return_value=(
+            [("Example_Pkg", "2.0")], True,
+        )):
+            sync_venv(conn, "/tmp/test-venv", check_uv=False)
+
+        assert old not in {row["id"] for row in get_orphan_packages(conn)}
+        rows = conn.execute("SELECT name, version FROM packages").fetchall()
+        assert [(row["name"], row["version"]) for row in rows] == [
+            ("example-pkg", "2.0"),
+        ]
+
+    def test_failed_sync_does_not_prune_old_version_records(self, conn, monkeypatch):
+        from uv_mgr.db import add_venv, ensure_package
+
+        add_venv(conn, "/tmp/test-venv")
+        old = ensure_package(conn, "example-pkg", "1.0")
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        monkeypatch.setattr(os.path, "isdir", lambda p: True)
+        with patch("uv_mgr.sync.scan_venv_packages", return_value=([], False)):
+            assert sync_venv(conn, "/tmp/test-venv", check_uv=False) is False
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM packages WHERE id = ?", (old,)
+        ).fetchone()[0] == 1
+
     def test_normal_sync(self, conn, monkeypatch, mock_uv_run_success):
         """#32 已注册 venv，目录存在，正常同步。"""
         from uv_mgr.db import add_venv

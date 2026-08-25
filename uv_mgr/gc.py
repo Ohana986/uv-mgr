@@ -7,6 +7,7 @@ from uv_mgr.db import (
     get_connection,
     get_orphan_packages,
     remove_orphan_packages,
+    record_operation,
 )
 from uv_mgr.sync import check_uv_version, sync_all
 
@@ -45,11 +46,14 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
                 print("正在同步 venv 状态...")
             if not sync_all(conn, auto_discover=True, verbose=verbose):
                 print("错误: venv 同步失败，已中止 GC；未执行缓存清理。", file=sys.stderr)
+                record_operation(conn, "gc", success=False,
+                                 error="venv 同步失败，未执行缓存清理")
                 return 1
         else:
             ok, message = check_uv_version()
             if not ok:
                 print(f"错误: {message}", file=sys.stderr)
+                record_operation(conn, "gc", success=False, error=message)
                 return 1
 
         # 找出完全孤立的包
@@ -57,6 +61,8 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
 
         if not orphans:
             print("没有需要清理的孤立包。")
+            record_operation(conn, "gc_dry_run" if dry_run else "gc",
+                             summary="没有需要清理的完全孤立包")
             return 0
 
         total_versions = sum(len(o["versions"]) for o in orphans)
@@ -69,6 +75,10 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
         if dry_run:
             print(f"\n[dry-run] 将清理 {len(orphans)} 个包，共 {total_versions} 个版本")
             print("[dry-run] 未执行实际清理。运行 uv-mgr index gc（不带 --dry-run）以执行。")
+            record_operation(
+                conn, "gc_dry_run",
+                summary=f"预览 {len(orphans)} 个包、{total_versions} 个版本",
+            )
             return 0
 
         # 实际清理
@@ -112,6 +122,12 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True,
                 remove_orphan_packages(conn, orphan_ids)
 
         print(f"\n已清理 {len(cleaned_names)}/{len(orphans)} 个孤立包。")
-        return 1 if failed_count else 0
+        success = failed_count == 0
+        record_operation(
+            conn, "gc", success=success,
+            summary=f"已清理 {len(cleaned_names)}/{len(orphans)} 个完全孤立包",
+            error=None if success else f"{failed_count} 个包清理失败",
+        )
+        return 0 if success else 1
     finally:
         conn.close()
