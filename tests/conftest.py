@@ -100,7 +100,8 @@ def mock_path_isdir():
 
 @pytest.fixture
 def unset_uv_sync_after(monkeypatch):
-    """确保 UV_SYNC_AFTER 环境变量不存在。"""
+    """确保 UV_MGR_SYNC_AFTER 和旧名 UV_SYNC_AFTER 环境变量均不存在。"""
+    monkeypatch.delenv("UV_MGR_SYNC_AFTER", raising=False)
     monkeypatch.delenv("UV_SYNC_AFTER", raising=False)
 
 

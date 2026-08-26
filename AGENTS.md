@@ -1,6 +1,6 @@
 # uv-mgr 项目
 
-项目目录: `/run/media/xr_w/U_Pan/Documents/Projects/auv/`
+项目目录: `/home/xr_w/Documents/My_Doc/Projects/uv_mgr/`
 
 ## 项目概述
 
@@ -8,7 +8,7 @@
 
 ### 技术栈
 
-- 纯 Python 3.10+，零外部依赖（只用标准库: `sqlite3`, `json`, `subprocess`, `argparse`, `os`, `sys`, `pathlib`, `datetime`）
+- 纯 Python 3.10+，零外部依赖（只用标准库: `sqlite3`, `json`, `subprocess`, `argparse`, `os`, `sys`, `pathlib`, `datetime`, `re`, `ntpath`, `shutil`）
 - 构建系统: setuptools
 - 数据库: SQLite (WAL 模式)，路径 `~/.local/share/uv-mgr/index.db`
 - 安装方式: `pip install -e .` (editable) 或 `uv tool install .`
@@ -16,55 +16,90 @@
 ## 架构
 
 ```
-├── pyproject.toml          # 项目元数据，entry point: uv_mgr.cli:main
-├── README.md               # 用户文档
-├── QWEN.md                 # 本文件：项目 QWEN 配置 + 已知陷阱
+├── pyproject.toml           # 项目元数据，entry point: uv_mgr.cli:main
+├── uv.lock                  # uv 锁文件
+├── README.md                # 用户文档
+├── CHANGELOG.md             # 更新日志
+├── RELEASE_NOTES.md         # 发布说明
+├── CONTRIBUTING.md          # 贡献指南
+├── LICENSE                  # MIT 许可
+├── AGENTS.md                # 本文件：项目配置 + 已知陷阱
+├── .github/
+│   ├── workflows/ci.yml     # CI 流水线
+│   └── ISSUE_TEMPLATE/      # Issue 模板
 ├── uv_mgr/
-│   ├── __init__.py          # __version__ = "0.1.0"
-│   ├── __main__.py          # python -m uv_mgr 入口
-│   ├── cli.py               # argparse 调度 + uv 透传
-│   ├── db.py                # SQLite 层（建表/迁移/CRUD）
-│   ├── sync.py              # Venv 状态同步（扫描+索引更新）
-│   └── gc.py                # 孤立包 GC（委托 uv cache clean）
+│   ├── __init__.py           # __version__ = "0.1.0"
+│   ├── __main__.py           # python -m uv_mgr 入口
+│   ├── cli.py                # argparse 调度 + uv 透传
+│   ├── config.py             # 平台路径与外部命令配置
+│   ├── db.py                 # SQLite 层（建表/迁移/CRUD）
+│   ├── sync.py               # Venv 状态同步（扫描+索引更新）
+│   └── gc.py                 # 孤立包 GC（委托 uv cache clean）
+├── tests/
+│   ├── __init__.py
+│   ├── conftest.py           # pytest fixtures（内存数据库、mock 环境）
+│   ├── test_config.py        # 配置与路径测试
+│   ├── test_db.py            # 数据库 CRUD 与迁移测试
+│   ├── test_sync.py          # 同步逻辑与 uv 版本检查测试
+│   ├── test_gc.py            # GC 策略与重建逻辑测试
+│   ├── test_cli.py           # CLI 入口与 --version 测试
+│   └── test_integration.py   # 端到端集成测试
 ├── test-proj-a/
-│   └── .venv/               # 测试用 venv
-├── test-proj-b/
-│   └── .venv/               # 测试用 venv
-└── uv_mgr.egg-info/         # pip install -e . 生成
+│   └── .venv/                # 测试用 venv（pytest, pygments, packaging 等）
+├── build/                    # 构建产物（可删除）
+└── dist/                     # 发行物（可删除）
 ```
 
 ### 模块职责
 
 | 模块 | 职责 |
 |------|------|
-| `cli.py` | argparse 解析、命令路由、自有命令（add/remove/list/sync/gc/db）与 uv 透传的调度 |
-| `db.py` | SQLite 建表、schema 版本管理、venv/package/venv_packages 的 CRUD |
-| `sync.py` | 扫描 venv 已安装包 → 更新数据库索引，自动发现新 venv |
-| `gc.py` | 找出孤立包 → `uv cache clean <pkg>` 安全清理 |
+| `cli.py` | argparse 解析、命令路由、自有命令（index/db/gc）与 uv 透传的调度 |
+| `config.py` | 平台判断（Windows/POSIX）、数据目录与数据库路径解析、uv 可执行文件发现、路径规范化 |
+| `db.py` | SQLite 建表、schema 版本管理（当前 v10）、venv/package/venv_packages 及历史表的 CRUD |
+| `sync.py` | 扫描 venv 已安装包 -> 更新数据库索引，自动发现新 venv，uv 版本检查 |
+| `gc.py` | 找出孤立包 -> `uv cache clean <pkg>` 安全清理，旧版本重建与恢复 |
 
 ### 数据库 Schema
 
-- `_meta`: key-value 存储，`schema_version=1`
-- `venvs`: id, path(UNIQUE), name, python_version, created_at, last_synced_at
-- `packages`: id, name, version (UNIQUE name+version)
-- `venv_packages`: venv_id FK, package_id FK, installed_at (复合主键 PK)
-- 外键: CASCADE 删除
+Schema 版本: 10（通过 `_meta` 表的 `schema_version` 键管理，含 v1->v2 ... v9->v10 迁移函数）
+
+| 表 | 说明 |
+|------|------|
+| `_meta` | key-value 存储，`schema_version` |
+| `venvs` | id, path(UNIQUE), name, python_version, source('user'/'auto'/'tool'), created_at, last_synced_at |
+| `packages` | id, name, version (UNIQUE name+version) |
+| `venv_packages` | venv_id FK, package_id FK, installed_at (复合主键) |
+| `operations` | id, occurred_at, operation_type, success, venv_path, summary, error |
+| `sync_snapshots` | id, venv_path, python_version, occurred_at, operation_id FK |
+| `snapshot_packages` | snapshot_id FK, name, version (复合主键) |
+| `package_events` | id, venv_path, occurred_at, event_type, name, old_version, new_version, snapshot_id FK |
+| `cache_rebuild_failures` | environment_path(PK), environment_type, command_json, attempts, last_error, last_failed_at |
+| `cache_rebuild_baseline` | name, version, observed_at (复合主键) |
+| `tool_rebuild_metadata` | environment_path(PK), arguments_json, python_version, recorded_at |
+
+- 外键: CASCADE 删除（venv_packages、snapshot_packages）；SET NULL（sync_snapshots.operation_id、package_events.snapshot_id）
 
 ## CLI 命令
 
 | 命令 | 说明 |
 |------|------|
-| `uv-mgr add <path>` | 注册一个 venv |
-| `uv-mgr remove <path>` | 取消注册 |
-| `uv-mgr list [--venvs\|--packages\|--orphans]` | 查询索引状态 |
-| `uv-mgr sync [path]` | 同步 venv 包状态（默认全部） |
-| `uv-mgr gc [--dry-run]` | GC：清理孤立缓存包 |
+| `uv-mgr index add <path>` | 注册一个 venv |
+| `uv-mgr index remove <path>` | 取消注册 |
+| `uv-mgr index list [--venvs\|--packages\|--orphans] [--type user\|auto\|tool]` | 查询索引状态 |
+| `uv-mgr index sync [path] [-v]` | 同步 venv 包状态（默认全部） |
+| `uv-mgr index gc [path] [-v]` | 同步并清理已不存在的 venv 记录 |
+| `uv-mgr gc [--dry-run] [--rebuild] [--retry]` | GC：清理孤立缓存包 |
 | `uv-mgr db info` | 数据库统计信息 |
+| `uv-mgr db history [--venv\|--package\|--events\|--snapshots] [--limit N]` | 操作/事件/快照历史 |
 | `uv-mgr <uv args...>` | 透传 uv，执行后自动 sync |
 
 ### 环境变量
 
-- `UV_SYNC_AFTER=0` — 跳过透传 uv 后的自动 sync
+- `UV_MGR_SYNC_AFTER=0` - 跳过透传 uv 后的自动 sync（旧名 `UV_SYNC_AFTER` 仍可用，但会打印弃用警告）
+- `UV_MGR_DATA_DIR` - 数据目录覆盖
+- `UV_MGR_DB_PATH` - 数据库完整路径覆盖（优先级最高）
+- `UV_MGR_UV_BIN` - uv 可执行文件路径覆盖
 
 ## 构建与运行
 
@@ -76,9 +111,12 @@ pip install -e .
 uv-mgr <command>
 python -m uv_mgr <command>
 
-# 测试用 venv 已预置
-# test-proj-a/.venv/  - 含 pytest, attrs, iniconfig, packaging, pluggy
-# test-proj-b/.venv/  - 含 pygments
+# 运行测试
+python -m pytest -q
+
+# 构建发行物（需先删除旧 build/ 目录）
+uv run python -m build --sdist --wheel
+uv run python -m twine check dist/*
 ```
 
 ## 开发约定
@@ -93,19 +131,26 @@ python -m uv_mgr <command>
 
 ### 设计原则（已确认，不可违背）
 
-1. **纯 stdlib** — 零外部依赖，只用 Python 标准库
-2. **委托 uv** — 包操作（install/uninstall/list/clean）全部委托给 uv 命令，uv-mgr 只维护索引
-3. **安全优先** — GC 只清理所有版本都不被引用的包，提供 `--dry-run` 预览
-4. **分离原则** — `sync` 只更新索引，`gc` 才执行物理删除，不自动联动
-5. **全量替换** — Sync 时全量替换该 venv 的 packages 记录（先删后插），不做增量 diff
-6. **命令优先级** — uv-mgr 自有命令优先处理，非自有命令全部透传给 uv
-7. **手动注册** — venv 发现采用手动注册（`uv-mgr add`）+ sync 时自动扫描 `.venv` 的模式
+1. **纯 stdlib** - 零外部依赖，只用 Python 标准库
+2. **委托 uv** - 包操作（install/uninstall/list/clean）全部委托给 uv 命令，uv-mgr 只维护索引
+3. **安全优先** - GC 只清理所有版本都不被引用的包，提供 `--dry-run` 预览
+4. **分离原则** - `index sync` 只更新索引，`index gc` 在同步时清理失效 venv 记录，`gc` 才执行物理缓存删除，三者不自动联动
+5. **全量替换** - Sync 时全量替换该 venv 的 packages 记录（先删后插），不做增量 diff
+6. **命令优先级** - uv-mgr 自有命令优先处理，非自有命令全部透传给 uv
+7. **自动发现** - venv 发现采用手动注册（`uv-mgr index add`）+ sync 时自动扫描当前目录及祖先目录 `.venv` 和 `uv tool dir` 工具环境的模式
 
 ### 测试
 
-- 项目没有单元测试文件（无 `tests/` 目录）
-- 验证方式：手动端到端测试，使用 `test-proj-a/.venv` 和 `test-proj-b/.venv` 两个测试环境
-- TODO: 需要补充测试
+- 测试目录: `tests/`，使用 pytest
+- 测试文件:
+  - `test_config.py` - 配置与路径解析
+  - `test_db.py` - 数据库 CRUD 与 schema 迁移
+  - `test_sync.py` - 同步逻辑与 uv 版本检查
+  - `test_gc.py` - GC 策略与重建逻辑
+  - `test_cli.py` - CLI 入口与 --version 行为
+  - `test_integration.py` - 端到端集成测试（使用 `test-proj-a/.venv`）
+- `conftest.py` 提供内存数据库 fixture、mock 环境变量等
+- CI: GitHub Actions，在 Ubuntu/Windows 上测试 Python 3.10-3.13
 
 ## 已知陷阱 / 注意事项
 
@@ -126,12 +171,12 @@ python -m uv_mgr <command>
 - `uv pip list --format=json` 返回 `[{"name":"pip","version":"26.1.2"}]` 格式
 - `uv tool run` 的别名是 `uvx`，所以本工具不能叫 `uvx`（已改为 `uv-mgr`）
 
-### 4. 开发环境
+### 4. 数据库
 
-- 工具安装在 `Agent` conda 环境中（`~/.local/share/uv-mgr/index.db` 是数据库路径）
-- 项目本身使用系统 Python，不依赖 conda 环境
 - 数据库使用了 WAL 模式（`PRAGMA journal_mode=WAL`），并发读取性能较好
+- `db.py` 中 `DB_PATH` 和 `DB_DIR` 在模块加载时从 `config.py` 计算，但 `_current_db_path()` 会在运行时重新读取环境变量，确保 `UV_MGR_DB_PATH` 和测试覆盖生效
 
-## 相关项目技能
+### 5. 环境变量命名
 
-该项目注册了 `build-cli-wrapper` 技能，用于指导 CLI 包装器的构建模式。
+- 所有 uv-mgr 自有环境变量使用 `UV_MGR_` 前缀（`UV_MGR_SYNC_AFTER`、`UV_MGR_DATA_DIR`、`UV_MGR_DB_PATH`、`UV_MGR_UV_BIN`）
+- 旧名 `UV_SYNC_AFTER` 保留兼容层，触发时打印弃用警告到 stderr

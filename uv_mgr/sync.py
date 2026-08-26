@@ -85,7 +85,12 @@ def venv_python_path(venv_path: str) -> Path | None:
 
 def should_sync_after_uv(args: list[str]) -> bool:
     """判断 uv 子命令执行后是否需要 sync。"""
+    if os.environ.get("UV_MGR_SYNC_AFTER") == "0":
+        return False
     if os.environ.get("UV_SYNC_AFTER") == "0":
+        import sys
+        print("警告: UV_SYNC_AFTER 已弃用，请改用 UV_MGR_SYNC_AFTER。",
+              file=sys.stderr)
         return False
     if not args:
         return False

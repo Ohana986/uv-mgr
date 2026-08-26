@@ -165,7 +165,8 @@ class TestAutoDiscover:
         monkeypatch.setattr(os.path, "isdir", lambda p: p == "/tmp/project-with-venv/.venv")
         monkeypatch.setattr(Path, "is_dir", lambda self: self.name == ".venv")
 
-        sync_all(conn, auto_discover=True)
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            sync_all(conn, auto_discover=True)
 
         from uv_mgr.db import list_venvs
         venvs = list_venvs(conn)
@@ -174,11 +175,11 @@ class TestAutoDiscover:
 
 
 class TestEnvVarSkipSync:
-    """#85 UV_SYNC_AFTER=0 跳过自动 sync。"""
+    """#85 UV_MGR_SYNC_AFTER=0 跳过自动 sync。"""
 
     def test_env_var_skips_sync(self, monkeypatch):
         from uv_mgr.sync import should_sync_after_uv
-        monkeypatch.setenv("UV_SYNC_AFTER", "0")
+        monkeypatch.setenv("UV_MGR_SYNC_AFTER", "0")
         assert should_sync_after_uv(["pip", "install", "x"]) is False
 
 

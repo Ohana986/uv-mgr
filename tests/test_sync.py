@@ -38,9 +38,16 @@ class TestShouldSyncAfterUv:
         assert should_sync_after_uv(["version"]) is False
 
     def test_env_var_disables(self):
-        """#26 UV_SYNC_AFTER=0 跳过 sync。"""
+        """#26 UV_MGR_SYNC_AFTER=0 跳过 sync。"""
+        with patch.dict(os.environ, {"UV_MGR_SYNC_AFTER": "0"}):
+            assert should_sync_after_uv(["pip", "install", "x"]) is False
+
+    def test_deprecated_env_var_still_works(self, unset_uv_sync_after, capsys):
+        """旧名 UV_SYNC_AFTER=0 仍能跳过 sync，但打印弃用警告。"""
         with patch.dict(os.environ, {"UV_SYNC_AFTER": "0"}):
             assert should_sync_after_uv(["pip", "install", "x"]) is False
+        err = capsys.readouterr().err
+        assert "UV_SYNC_AFTER" in err and "弃用" in err
 
     def test_empty_args(self, unset_uv_sync_after):
         """空参数返回 False。"""
@@ -353,7 +360,9 @@ class TestSyncAll:
         monkeypatch.setattr(Path, "cwd", lambda: Path("/tmp/some-project"))
         monkeypatch.setattr(os.path, "isdir", lambda p: p in existing_dirs)
 
-        sync_all(conn, auto_discover=True)
+        # 自动发现测试不依赖外部 uv；只验证目录发现和注册逻辑。
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            sync_all(conn, auto_discover=True)
         captured = capsys.readouterr()
         assert "发现新 venv" in captured.out or "已同步" in captured.out
 
@@ -373,7 +382,9 @@ class TestSyncAll:
         monkeypatch.setattr(Path, "cwd", lambda: Path("/parent/child/deep"))
         monkeypatch.setattr(os.path, "isdir", lambda p: p in existing_dirs)
 
-        sync_all(conn, auto_discover=True)
+        # 自动发现测试不依赖外部 uv；只验证目录发现和注册逻辑。
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            sync_all(conn, auto_discover=True)
         venvs = list_venvs(conn)
         # 应只发现 /parent/.venv 这一个
         assert len(venvs) == 1
@@ -393,7 +404,8 @@ class TestSyncAll:
         monkeypatch.setattr(Path, "cwd", lambda: Path("/tmp/project"))
         monkeypatch.setattr(os.path, "isdir", lambda p: p in existing_dirs)
 
-        sync_all(conn, auto_discover=True)
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            sync_all(conn, auto_discover=True)
         count_after = len(list_venvs(conn))
         assert count_after == count_before  # 不会增加
 
@@ -407,7 +419,8 @@ class TestSyncAll:
         monkeypatch.setattr(os.path, "isdir", lambda p: True)
 
         # 不报错即可
-        sync_all(conn, auto_discover=False)
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
+            sync_all(conn, auto_discover=False)
 
 
 # ── #43~45 run_uv_passthrough ──────────────────────────────────────

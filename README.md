@@ -156,7 +156,12 @@ uv-mgr db history --snapshots --venv /path/to/venv
 
 ## 环境变量
 
-- `UV_SYNC_AFTER=0` — 跳过透传 uv 后的自动 sync
+- `UV_MGR_SYNC_AFTER=0` — 跳过透传 uv 后的自动 sync
+- `UV_MGR_DATA_DIR` — 数据目录，默认数据库将创建为该目录中的 `index.db`
+- `UV_MGR_DB_PATH` — 索引数据库完整路径，优先级最高
+- `UV_MGR_UV_BIN` — 指定 `uv` 或 `uv.exe` 的完整路径，适用于未加入 PATH 的安装
+
+> 旧名 `UV_SYNC_AFTER` 仍可使用，但会打印弃用警告，请尽快迁移到 `UV_MGR_SYNC_AFTER`。
 
 ## 项目结构
 
@@ -174,12 +179,6 @@ uv-mgr/
 `$XDG_DATA_HOME/uv-mgr/index.db`（未设置时为 `~/.local/share/uv-mgr/index.db`）；
 Windows 默认是 `%LOCALAPPDATA%\\uv-mgr\\index.db`，没有该变量时依次使用
 `%APPDATA%` 与用户目录的 `AppData\\Local`。
-
-可通过下列环境变量调整，无需修改命令参数：
-
-- `UV_MGR_DB_PATH`：索引数据库完整路径，优先级最高。
-- `UV_MGR_DATA_DIR`：数据目录，默认数据库将创建为该目录中的 `index.db`。
-- `UV_MGR_UV_BIN`：指定 `uv` 或 `uv.exe` 的完整路径，适用于未加入 PATH 的安装。
 
 Windows 的 venv 解释器会自动使用 `Scripts\\python.exe`；POSIX 系统使用
 `bin/python`。所有路径输入都会转为绝对路径，Windows 上还会消除盘符和大小写
