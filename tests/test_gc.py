@@ -1,6 +1,7 @@
 """GC 层测试。"""
 
 from unittest.mock import MagicMock, patch
+from uv_mgr.config import normalize_path, resolve_uv_command, subprocess_text_kwargs
 
 from uv_mgr.gc import (
     _get_packages_all_versions_orphaned, _parse_tool_receipt,
@@ -34,7 +35,7 @@ class TestGc:
         with patch("uv_mgr.gc.check_uv_version", return_value=(True, "1.0")), \
              patch("subprocess.run", return_value=MagicMock(returncode=0, stderr="")) as run:
             assert gc(auto_sync=False) == 0
-        assert [call.args[0] for call in run.call_args_list] == [["uv", "cache", "clean", "orphan-pkg"]]
+        assert [call.args[0] for call in run.call_args_list] == [resolve_uv_command(["uv", "cache", "clean", "orphan-pkg"])]
 
     def test_rebuild_cleans_candidate_names_once_and_syncs_project(self, conn, tmp_path, monkeypatch):
         from uv_mgr.db import add_venv, ensure_package, record_sync_history, replace_venv_packages
@@ -55,9 +56,9 @@ class TestGc:
              patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
             assert gc(auto_sync=False, rebuild=True) == 0
         commands = [call.args[0] for call in run.call_args_list]
-        assert ["uv", "cache", "clean", "first", "second"] in commands
-        sync_call = next(call for call in run.call_args_list if call.args[0] == ["uv", "sync"])
-        assert sync_call.kwargs == {"cwd": str(project), "timeout": 900}
+        assert resolve_uv_command(["uv", "cache", "clean", "first", "second"]) in commands
+        sync_call = next(call for call in run.call_args_list if call.args[0] == resolve_uv_command(["uv", "sync"]))
+        assert sync_call.kwargs == {"cwd": normalize_path(project), "timeout": 900}
 
     def test_rebuild_failure_is_retried_without_cleaning(self, conn, db_path, tmp_path, monkeypatch):
         from uv_mgr.db import add_venv, ensure_package, get_rebuild_failures, record_sync_history, replace_venv_packages
@@ -85,7 +86,7 @@ class TestGc:
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: reopened)
         with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
             assert gc(auto_sync=False, rebuild=True, retry=True) == 0
-        run.assert_called_once_with(["uv", "sync"], cwd=str(project), capture_output=True, text=True, timeout=900)
+        run.assert_called_once_with(resolve_uv_command(["uv", "sync"]), cwd=normalize_path(project), capture_output=True, text=True, timeout=900, **subprocess_text_kwargs())
         final = sqlite3.connect(str(db_path))
         final.row_factory = sqlite3.Row
         assert get_rebuild_failures(final) == []
@@ -112,7 +113,7 @@ class TestGc:
              ]) as run:
             assert gc(auto_sync=False, rebuild=True) == 1
         restore_call = run.call_args_list[1]
-        assert restore_call.kwargs == {"cwd": str(project), "timeout": 900}
+        assert restore_call.kwargs == {"cwd": normalize_path(project), "timeout": 900}
         import sqlite3
         reopened = sqlite3.connect(str(db_path))
         reopened.row_factory = sqlite3.Row
@@ -147,7 +148,7 @@ class TestGc:
         )
         with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
             assert gc(rebuild=True) == 0
-        assert ["uv", "sync"] in [call.args[0] for call in run.call_args_list]
+        assert resolve_uv_command(["uv", "sync"]) in [call.args[0] for call in run.call_args_list]
         assert "跳过" in capsys.readouterr().out
 
     def test_dry_run_does_not_execute_commands(self, conn, monkeypatch):

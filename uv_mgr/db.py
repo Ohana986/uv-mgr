@@ -9,7 +9,7 @@ from pathlib import Path
 
 from uv_mgr.config import get_data_dir, get_db_path, is_windows, normalize_path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 DB_DIR = get_data_dir()
 DB_PATH = get_db_path()
@@ -337,6 +337,25 @@ def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
     print("数据库迁移: v9 → v10（已规范化 Windows venv 路径）")
 
 
+def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    """统一 Windows 历史审计表中的 venv 路径。"""
+    if is_windows():
+        for table in ("operations", "sync_snapshots", "package_events"):
+            rows = conn.execute(
+                f"SELECT id, venv_path FROM {table} WHERE venv_path IS NOT NULL"
+            ).fetchall()
+            for row in rows:
+                normalized = normalize_path(row["venv_path"])
+                if normalized != row["venv_path"]:
+                    conn.execute(
+                        f"UPDATE {table} SET venv_path = ? WHERE id = ?",
+                        (normalized, row["id"]),
+                    )
+    conn.execute("UPDATE _meta SET value = '11' WHERE key = 'schema_version'")
+    conn.commit()
+    print("数据库迁移: v10 → v11（已规范化历史记录中的 Windows 路径）")
+
+
 def _migrate_environment_paths(conn: sqlite3.Connection, table: str,
                                old_paths: list[str], normalized: str,
                                *, environment_type: str | None = None) -> None:
@@ -411,6 +430,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             version = 9
         if version < 10:
             _migrate_v9_to_v10(conn)
+            version = 10
+        if version < 11:
+            _migrate_v10_to_v11(conn)
         elif version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"数据库 schema 版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}，"
@@ -542,6 +564,8 @@ def record_operation(
     occurred_at: str | None = None,
 ) -> int:
     """写入一条独立于当前索引的内部操作审计记录。"""
+    if venv_path is not None:
+        venv_path = normalize_path(venv_path)
     cur = conn.execute(
         """INSERT INTO operations
            (occurred_at, operation_type, success, venv_path, summary, error)
@@ -584,6 +608,7 @@ def record_sync_history(
     packages: list[tuple[str, str]],
 ) -> int:
     """保存成功同步的完整快照，并记录相对前一快照的包变更。"""
+    venv_path = normalize_path(venv_path)
     now = _now()
     current = {normalize_package_name(name): version for name, version in packages}
     previous_snapshot = conn.execute(
@@ -650,6 +675,7 @@ def get_operations(conn: sqlite3.Connection, *, venv_path: str | None = None,
     sql = "SELECT * FROM operations"
     params: list[object] = []
     if venv_path:
+        venv_path = normalize_path(venv_path)
         sql += " WHERE venv_path = ?"
         params.append(venv_path)
     sql += " ORDER BY occurred_at DESC, id DESC LIMIT ?"
@@ -662,6 +688,7 @@ def get_package_events(conn: sqlite3.Connection, *, venv_path: str | None = None
     clauses: list[str] = []
     params: list[object] = []
     if venv_path:
+        venv_path = normalize_path(venv_path)
         clauses.append("venv_path = ?")
         params.append(venv_path)
     if package_name:
@@ -683,6 +710,7 @@ def get_snapshots(conn: sqlite3.Connection, *, venv_path: str | None = None,
         sql += " JOIN snapshot_packages p ON p.snapshot_id = s.id"
     clauses: list[str] = []
     if venv_path:
+        venv_path = normalize_path(venv_path)
         clauses.append("s.venv_path = ?")
         params.append(venv_path)
     if package_name:

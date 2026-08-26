@@ -64,4 +64,4 @@ class TestCommandsAndPaths:
     def test_windows_interpreter_is_preferred(self, monkeypatch):
         monkeypatch.setattr(config.sys, "platform", "win32")
         candidates = config.venv_python_candidates("environment")
-        assert str(candidates[0]).endswith("Scripts/python.exe")
+        assert candidates[0] == Path("environment") / "Scripts" / "python.exe"

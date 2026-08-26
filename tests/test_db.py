@@ -29,6 +29,7 @@ from uv_mgr.db import (
     get_snapshots,
     get_snapshot_packages,
 )
+from uv_mgr.config import normalize_path
 
 
 # ── #1 初始化空库 ──────────────────────────────────────────────────
@@ -154,7 +155,7 @@ class TestInitDb:
         ).fetchone()[0] == r"c:\users\alice\proj"
         assert conn.execute(
             "SELECT value FROM _meta WHERE key = 'schema_version'"
-        ).fetchone()[0] == "10"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
 
         from uv_mgr.sync import sync_venv
         monkeypatch.setattr("uv_mgr.sync.os.path.isdir", lambda _path: True)
@@ -177,6 +178,34 @@ class TestInitDb:
         init_db(conn)
 
         assert conn.execute("SELECT path FROM venvs").fetchone()[0] == "/Tmp/Mixed/.venv"
+
+    def test_migrate_v10_to_v11_normalizes_history_paths(self, conn, monkeypatch):
+        monkeypatch.setattr("uv_mgr.config.sys.platform", "win32")
+        conn.execute("UPDATE _meta SET value = '10' WHERE key = 'schema_version'")
+        conn.execute(
+            "INSERT INTO operations (occurred_at, operation_type, success, venv_path) "
+            "VALUES ('2024-01-01', 'sync', 1, ?)",
+            (r"C:\Users\Alice\Proj\.venv",),
+        )
+        conn.execute(
+            "INSERT INTO sync_snapshots (venv_path, occurred_at) VALUES (?, '2024-01-01')",
+            (r"C:\Users\Alice\Proj\.venv",),
+        )
+        conn.execute(
+            "INSERT INTO package_events (venv_path, occurred_at, event_type, name) "
+            "VALUES (?, '2024-01-01', 'installed', 'demo')",
+            (r"C:\Users\Alice\Proj\.venv",),
+        )
+        conn.commit()
+
+        init_db(conn)
+
+        expected = r"c:\users\alice\proj\.venv"
+        for table in ("operations", "sync_snapshots", "package_events"):
+            assert conn.execute(f"SELECT venv_path FROM {table}").fetchone()[0] == expected
+        assert conn.execute(
+            "SELECT value FROM _meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
 
 
 # ── #3~9 Venv CRUD ────────────────────────────────────────────────
@@ -201,7 +230,7 @@ class TestVenvCrud:
         row = get_venv_by_path(conn, "/tmp/test-venv")
         assert row is not None
         assert row["id"] == vid
-        assert row["path"] == "/tmp/test-venv"
+        assert row["path"] == normalize_path("/tmp/test-venv")
         assert row["name"] == "test-venv"
         assert row["created_at"] is not None
 
@@ -443,10 +472,11 @@ class TestQueries:
         ).fetchone()[0] == 0
 
     def test_db_path(self):
-        """#20 数据库路径指向 ~/.local/share/uv-mgr/index.db。"""
+        """#20 数据库路径使用当前平台默认配置。"""
         import uv_mgr.db
-        assert uv_mgr.db.DB_PATH == Path.home() / ".local" / "share" / "uv-mgr" / "index.db"
-        assert uv_mgr.db.DB_DIR == Path.home() / ".local" / "share" / "uv-mgr"
+        from uv_mgr.config import get_data_dir, get_db_path
+        assert uv_mgr.db.DB_PATH == get_db_path()
+        assert uv_mgr.db.DB_DIR == get_data_dir()
 
     def test_foreign_key_cascade_on_venv_delete(self, conn):
         """#21 删除 venv → venv_packages 级联清理。"""

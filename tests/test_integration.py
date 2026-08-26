@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from uv_mgr.config import normalize_path
 
 
 class TestFullLifecycle:
@@ -162,7 +163,10 @@ class TestAutoDiscover:
         # 模拟 Path.cwd() 返回一个包含 .venv 的目录
         mock_cwd = Path("/tmp/project-with-venv")
         monkeypatch.setattr(Path, "cwd", lambda: mock_cwd)
-        monkeypatch.setattr(os.path, "isdir", lambda p: p == "/tmp/project-with-venv/.venv")
+        monkeypatch.setattr(
+            os.path, "isdir",
+            lambda p: normalize_path(p) == normalize_path("/tmp/project-with-venv/.venv"),
+        )
         monkeypatch.setattr(Path, "is_dir", lambda self: self.name == ".venv")
 
         with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
@@ -171,7 +175,7 @@ class TestAutoDiscover:
         from uv_mgr.db import list_venvs
         venvs = list_venvs(conn)
         # 至少自动注册了 .venv（可能有祖先路径的 .venv）
-        assert any("/.venv" in v["path"] or v["path"].endswith(".venv") for v in venvs)
+        assert any(v["path"].endswith(".venv") for v in venvs)
 
 
 class TestEnvVarSkipSync:

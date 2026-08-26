@@ -56,13 +56,13 @@
 |------|------|
 | `cli.py` | argparse 解析、命令路由、自有命令（index/db/gc）与 uv 透传的调度 |
 | `config.py` | 平台判断（Windows/POSIX）、数据目录与数据库路径解析、uv 可执行文件发现、路径规范化 |
-| `db.py` | SQLite 建表、schema 版本管理（当前 v10）、venv/package/venv_packages 及历史表的 CRUD |
+| `db.py` | SQLite 建表、schema 版本管理（当前 v11）、venv/package/venv_packages 及历史表的 CRUD |
 | `sync.py` | 扫描 venv 已安装包 -> 更新数据库索引，自动发现新 venv，uv 版本检查 |
 | `gc.py` | 找出孤立包 -> `uv cache clean <pkg>` 安全清理，旧版本重建与恢复 |
 
 ### 数据库 Schema
 
-Schema 版本: 10（通过 `_meta` 表的 `schema_version` 键管理，含 v1->v2 ... v9->v10 迁移函数）
+Schema 版本: 11（通过 `_meta` 表的 `schema_version` 键管理，含 v1->v2 ... v10->v11 迁移函数）
 
 | 表 | 说明 |
 |------|------|

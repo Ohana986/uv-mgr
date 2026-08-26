@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from uv_mgr.config import normalize_path, resolve_uv_command
 
 from uv_mgr.sync import (
     should_sync_after_uv,
@@ -160,8 +161,9 @@ class TestSyncVenv:
         with patch("uv_mgr.sync.scan_venv_packages", return_value=([], False)):
             assert sync_venv(conn, "/tmp/test-venv", check_uv=False) is False
 
-        assert len(get_snapshots(conn, venv_path="/tmp/test-venv")) == 1
-        operations = get_operations(conn, venv_path="/tmp/test-venv", limit=10)
+        path = normalize_path("/tmp/test-venv")
+        assert len(get_snapshots(conn, venv_path=path)) == 1
+        operations = get_operations(conn, venv_path=path, limit=10)
         assert any(row["operation_type"] == "sync" and row["success"] for row in operations)
         assert any(row["operation_type"] == "sync" and not row["success"] for row in operations)
 
@@ -323,7 +325,7 @@ class TestSyncVerbose:
             sync_all(conn, auto_discover=False, verbose=True)
 
         captured = capsys.readouterr()
-        assert "已同步: /tmp/forward-venv" in captured.out
+        assert f"已同步: {normalize_path('/tmp/forward-venv')}" in captured.out
 
 
 # ── #38~42 sync_all ────────────────────────────────────────────────
@@ -355,10 +357,10 @@ class TestSyncAll:
     def test_no_venvs_with_autodiscover(self, conn, monkeypatch, capsys):
         """#38 无注册 venv + auto_discover=True → 扫描当前目录 .venv。"""
         # 模拟 /tmp/some-project/.venv 存在，其他路径没有 .venv
-        existing_dirs = {"/tmp/some-project/.venv"}
-        monkeypatch.setattr(Path, "is_dir", lambda self: str(self) in existing_dirs)
+        existing_dirs = {normalize_path("/tmp/some-project/.venv")}
+        monkeypatch.setattr(Path, "is_dir", lambda self: normalize_path(self) in existing_dirs)
         monkeypatch.setattr(Path, "cwd", lambda: Path("/tmp/some-project"))
-        monkeypatch.setattr(os.path, "isdir", lambda p: p in existing_dirs)
+        monkeypatch.setattr(os.path, "isdir", lambda p: normalize_path(p) in existing_dirs)
 
         # 自动发现测试不依赖外部 uv；只验证目录发现和注册逻辑。
         with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
@@ -377,10 +379,10 @@ class TestSyncAll:
         from uv_mgr.db import list_venvs
 
         # 只在 /parent/.venv 存在, 子目录没有
-        existing_dirs = {"/parent/.venv"}
-        monkeypatch.setattr(Path, "is_dir", lambda self: str(self) in existing_dirs)
+        existing_dirs = {normalize_path("/parent/.venv")}
+        monkeypatch.setattr(Path, "is_dir", lambda self: normalize_path(self) in existing_dirs)
         monkeypatch.setattr(Path, "cwd", lambda: Path("/parent/child/deep"))
-        monkeypatch.setattr(os.path, "isdir", lambda p: p in existing_dirs)
+        monkeypatch.setattr(os.path, "isdir", lambda p: normalize_path(p) in existing_dirs)
 
         # 自动发现测试不依赖外部 uv；只验证目录发现和注册逻辑。
         with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
@@ -399,10 +401,10 @@ class TestSyncAll:
         count_before = len(list_venvs(conn))
 
         # sync_all 不会发现 /tmp/project/.venv，因为 .venv 在子目录的子目录里
-        existing_dirs = {"/tmp/project/.venv"}
-        monkeypatch.setattr(Path, "is_dir", lambda self: str(self) in existing_dirs)
+        existing_dirs = {normalize_path("/tmp/project/.venv")}
+        monkeypatch.setattr(Path, "is_dir", lambda self: normalize_path(self) in existing_dirs)
         monkeypatch.setattr(Path, "cwd", lambda: Path("/tmp/project"))
-        monkeypatch.setattr(os.path, "isdir", lambda p: p in existing_dirs)
+        monkeypatch.setattr(os.path, "isdir", lambda p: normalize_path(p) in existing_dirs)
 
         with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
             sync_all(conn, auto_discover=True)
@@ -432,7 +434,7 @@ class TestRunUvPassthrough:
         mock_run.return_value = MagicMock(returncode=0)
         with patch("uv_mgr.sync.check_uv_version", return_value=(True, "0.4.0")):
             assert run_uv_passthrough(["pip", "list"]) == 0
-        mock_run.assert_called_once_with(["uv", "pip", "list"])
+        mock_run.assert_called_once_with(resolve_uv_command(["uv", "pip", "list"]))
 
     @patch("subprocess.run", side_effect=FileNotFoundError)
     def test_uv_not_installed(self, mock_run, capsys):

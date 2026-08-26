@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from uv_mgr.config import normalize_path
 
 
 class TestToolReplayArguments:
@@ -209,7 +210,8 @@ class TestSyncCommand:
             args = MagicMock(venv_path="/tmp/my-venv", prune=False, verbose=False)
             _cmd_sync(args)
         mock.assert_called_once_with(
-            conn, "/tmp/my-venv", auto_register=True, prune=False, verbose=False
+            conn, normalize_path("/tmp/my-venv"), auto_register=True,
+            prune=False, verbose=False
         )
 
 
