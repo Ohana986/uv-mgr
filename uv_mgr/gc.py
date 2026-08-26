@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from uv_mgr.config import resolve_uv_command, subprocess_text_kwargs
+
 from uv_mgr.db import (
     clear_rebuild_failure,
     get_connection,
@@ -20,7 +22,7 @@ from uv_mgr.db import (
     replace_rebuild_baseline,
     remove_orphan_packages,
 )
-from uv_mgr.sync import check_uv_version, sync_all
+from uv_mgr.sync import check_uv_version, sync_all, sync_venv
 
 
 def _get_packages_all_versions_orphaned(conn) -> list[dict]:
@@ -164,19 +166,24 @@ def _get_rebuild_environments(conn, package_names: set[str]) -> tuple[list[dict]
         if not affected:
             continue
         venv_path = Path(venv["path"])
-        if venv["source"] == "tool":
+        if not venv_path.is_dir():
+            reason = "venv 目录不存在"
+        elif venv["source"] == "tool":
             command, reason = _tool_rebuild_command(conn, venv)
-            if command is not None:
+            tool_cwd = venv_path.parent
+            if command is not None and tool_cwd.is_dir():
                 targets.append({
                     "path": str(venv_path), "type": "tool", "command": command,
-                    "cwd": None, "packages": affected,
+                    "cwd": str(tool_cwd), "packages": affected,
                 })
                 continue
+            if command is not None:
+                reason = "tool 父目录不存在"
         else:
             project = venv_path.parent
             if venv_path.name == ".venv" and (project / "pyproject.toml").is_file():
                 targets.append({
-                    "path": str(project), "type": "project", "command": ["uv-mgr", "sync"],
+                    "path": str(project), "type": "project", "command": ["uv", "sync"],
                     "cwd": str(project), "packages": affected,
                 })
                 continue
@@ -194,11 +201,21 @@ def _run_environment(conn, environment: dict, *, stream_output: bool = False) ->
     command = environment["command"]
     try:
         if stream_output:
-            result = subprocess.run(command, cwd=environment["cwd"], timeout=900)
+            result = subprocess.run(resolve_uv_command(command), cwd=environment["cwd"], timeout=900)
         else:
             result = subprocess.run(
-                command, cwd=environment["cwd"], capture_output=True, text=True, timeout=900,
+                resolve_uv_command(command), cwd=environment["cwd"], capture_output=True, text=True,
+                timeout=900, **subprocess_text_kwargs(),
             )
+        if result.returncode == 0 and environment["type"] == "project":
+            venv_path = str(Path(environment["path"]) / ".venv")
+            if not sync_venv(conn, venv_path, auto_register=False, check_uv=False):
+                error = "项目环境已恢复，但索引同步失败"
+                record_rebuild_failure(
+                    conn, environment["path"], environment["type"], json.dumps(command), error,
+                )
+                print(f"  恢复失败: {environment['path']}: {error}")
+                return False
         if result.returncode == 0:
             clear_rebuild_failure(conn, environment["path"])
             print(f"  已恢复: {environment['path']}")
@@ -236,10 +253,20 @@ def _retry_rebuilds(conn) -> int:
             print(f"  恢复失败: {row['environment_path']}: 失败记录损坏")
             failed += 1
             continue
+        environment_path = Path(row["environment_path"])
+        if row["environment_type"] == "project":
+            available = environment_path.is_dir() and (environment_path / ".venv").is_dir()
+        else:
+            available = environment_path.is_dir() and environment_path.parent.is_dir()
+        if not available:
+            clear_rebuild_failure(conn, row["environment_path"])
+            print(f"  跳过失效环境: {row['environment_path']}")
+            continue
         environment = {
             "path": row["environment_path"], "type": row["environment_type"],
             "command": command,
-            "cwd": row["environment_path"] if row["environment_type"] == "project" else None,
+            "cwd": (row["environment_path"] if row["environment_type"] == "project"
+                    else str(environment_path.parent)),
         }
         if not _run_environment(conn, environment):
             failed += 1
@@ -256,8 +283,9 @@ def _clean_orphans(conn, orphans: list[dict]) -> tuple[list[str], int]:
         name = orphan["name"]
         print(f"正在清理: {name}...", end=" ", flush=True)
         try:
-            result = subprocess.run(["uv", "cache", "clean", name], capture_output=True,
-                                    text=True, timeout=120)
+            result = subprocess.run(resolve_uv_command(["uv", "cache", "clean", name]),
+                                    capture_output=True, text=True, timeout=120,
+                                    **subprocess_text_kwargs())
             if result.returncode == 0:
                 print("完成")
                 cleaned_names.append(name)
@@ -288,7 +316,7 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True, rebuild: bool = False,
             return _retry_rebuilds(conn)
         if not dry_run:
             if auto_sync:
-                if not sync_all(conn, auto_discover=True):
+                if not sync_all(conn, auto_discover=True, ignore_missing=rebuild):
                     print("错误: venv 同步失败，已中止 GC；未执行缓存清理。", file=sys.stderr)
                     record_operation(conn, "gc", success=False, error="venv 同步失败，未执行缓存清理")
                     return 1
@@ -325,8 +353,10 @@ def gc(dry_run: bool = False, *, auto_sync: bool = True, rebuild: bool = False,
         if rebuild and clean_names:
             print(f"正在一次清理 {len(clean_names)} 个待重建包名...")
             try:
-                result = subprocess.run(["uv", "cache", "clean", *clean_names], capture_output=True,
-                                        text=True, timeout=300)
+                result = subprocess.run(
+                    resolve_uv_command(["uv", "cache", "clean", *clean_names]),
+                    capture_output=True, text=True, timeout=300, **subprocess_text_kwargs(),
+                )
                 rebuild_clean_ok = result.returncode == 0
                 clean_error = result.stderr.strip() or "uv cache clean 执行失败"
             except subprocess.TimeoutExpired:

@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+from uv_mgr.config import normalize_path
+
 from uv_mgr import __version__
 from uv_mgr.db import (
     get_connection,
@@ -208,7 +210,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_add(args) -> int:
-    path = os.path.abspath(args.venv_path)
+    path = normalize_path(args.venv_path)
     if not os.path.isdir(path):
         print(f"错误: 目录不存在: {path}", file=sys.stderr)
         conn = get_connection()
@@ -219,7 +221,7 @@ def _cmd_add(args) -> int:
             conn.close()
         return 1
     if venv_python_path(path) is None:
-        print(f"错误: 不是有效的 venv（未找到 Python 解释器: {path}/bin/python 或 {path}/Scripts/python.exe）", file=sys.stderr)
+        print(f"错误: 不是有效的 venv（未找到 Python 解释器：{path}）", file=sys.stderr)
         conn = get_connection()
         try:
             record_operation(conn, "venv_added", success=False, venv_path=path,
@@ -235,7 +237,7 @@ def _cmd_add(args) -> int:
 
 
 def _cmd_remove(args) -> int:
-    path = os.path.abspath(args.venv_path)
+    path = normalize_path(args.venv_path)
     conn = get_connection()
     if remove_venv(conn, path):
         print(f"已移除 venv: {path}")
@@ -294,7 +296,7 @@ def _cmd_sync(args) -> int:
     try:
         if args.venv_path:
             success = sync_venv(
-                conn, os.path.abspath(args.venv_path),
+                conn, normalize_path(args.venv_path),
                 auto_register=True, prune=getattr(args, "prune", False),
                 verbose=args.verbose,
             )
@@ -313,12 +315,12 @@ def _cmd_index_gc(args) -> int:
     try:
         if args.venv_path:
             success = sync_venv(
-                conn, os.path.abspath(args.venv_path), auto_register=True,
+                conn, normalize_path(args.venv_path), auto_register=True,
                 prune=True, verbose=args.verbose,
             )
         else:
             success = sync_all(conn, auto_discover=True, prune=True,
-                               verbose=args.verbose)
+                               verbose=args.verbose, ignore_missing=True)
         return 0 if success else 1
     finally:
         conn.close()
@@ -360,7 +362,7 @@ def _cmd_db_history(conn, args) -> int:
     if limit < 1:
         print("错误: --limit 必须大于 0", file=sys.stderr)
         return 1
-    venv_path = os.path.abspath(args.history_venv) if args.history_venv else None
+    venv_path = normalize_path(args.history_venv) if args.history_venv else None
     package_name = args.history_package
     if args.snapshots:
         snapshots = get_snapshots(

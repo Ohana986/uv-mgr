@@ -60,6 +60,16 @@ class TestUvVersion:
         from uv_mgr.sync import check_uv_version
         assert check_uv_version()[0] is False
 
+    @patch("subprocess.run")
+    def test_windows_uses_resolved_uv_executable(self, mock_run, monkeypatch):
+        from uv_mgr.sync import check_uv_version
+
+        monkeypatch.setattr("uv_mgr.config.sys.platform", "win32")
+        monkeypatch.setattr("uv_mgr.config.shutil.which", lambda _name: r"C:\\Tools\\uv.exe")
+        mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.4.7", stderr="")
+        assert check_uv_version()[0] is True
+        assert mock_run.call_args.args[0][0] == r"C:\\Tools\\uv.exe"
+
 
 # ── #27~31 scan_venv_packages ──────────────────────────────────────
 
@@ -121,6 +131,15 @@ class TestScanVenvPackages:
 # ── #32~37 sync_venv ───────────────────────────────────────────────
 
 class TestSyncVenv:
+    def test_windows_scripts_python_exe_is_recognized(self, tmp_path, monkeypatch):
+        from uv_mgr.sync import venv_python_path
+
+        monkeypatch.setattr("uv_mgr.config.sys.platform", "win32")
+        venv = tmp_path / "venv"
+        python = venv / "Scripts" / "python.exe"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        assert venv_python_path(str(venv)) == python
     def test_sync_records_snapshot_and_failure_audit(self, conn, monkeypatch):
         from uv_mgr.db import add_venv, get_operations, get_snapshots
 
@@ -303,6 +322,29 @@ class TestSyncVerbose:
 # ── #38~42 sync_all ────────────────────────────────────────────────
 
 class TestSyncAll:
+    def test_missing_cwd_skips_discovery_and_continues(self, conn, monkeypatch, capsys):
+        """失效当前目录不应阻断已注册环境和 tool 的同步。"""
+        from uv_mgr.db import add_venv
+
+        add_venv(conn, "/tmp/registered")
+        monkeypatch.setattr(Path, "cwd", lambda: (_ for _ in ()).throw(FileNotFoundError()))
+        monkeypatch.setattr("uv_mgr.sync.discover_tool_venvs", lambda: [])
+        with patch("uv_mgr.sync.check_uv_version", return_value=(True, "1.0")), \
+             patch("uv_mgr.sync.sync_venv", return_value=True) as sync:
+            assert sync_all(conn, auto_discover=True) is True
+        sync.assert_called_once()
+        assert "当前工作目录已不存在" in capsys.readouterr().err
+
+    def test_prune_missing_venv_is_successful(self, conn, capsys):
+        """index gc 清理失效记录后不应报告同步失败。"""
+        from uv_mgr.db import add_venv, get_venv_by_path
+
+        path = "/tmp/missing-for-prune"
+        add_venv(conn, path)
+        assert sync_venv(conn, path, prune=True) is True
+        assert get_venv_by_path(conn, path) is None
+        assert "已清理失效记录" in capsys.readouterr().out
+
     def test_no_venvs_with_autodiscover(self, conn, monkeypatch, capsys):
         """#38 无注册 venv + auto_discover=True → 扫描当前目录 .venv。"""
         # 模拟 /tmp/some-project/.venv 存在，其他路径没有 .venv

@@ -2,6 +2,7 @@
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -106,6 +107,76 @@ class TestInitDb:
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tool_rebuild_metadata'"
         ).fetchone() is not None
+
+    def test_migrate_v9_to_v10_normalizes_windows_paths(self, conn, monkeypatch):
+        monkeypatch.setattr("uv_mgr.config.sys.platform", "win32")
+        conn.execute("UPDATE _meta SET value = '9' WHERE key = 'schema_version'")
+        conn.execute(
+            "INSERT INTO venvs (id, path, name, source, created_at) VALUES "
+            "(10, ?, 'project', 'auto', '2024-01-01'), "
+            "(11, ?, 'project', 'auto', '2024-01-02')",
+            (r"C:\Users\Alice\Proj\.venv", r"c:\users\alice\proj\.VENV"),
+        )
+        package = ensure_package(conn, "demo", "1.0")
+        conn.execute(
+            "INSERT INTO venv_packages (venv_id, package_id) VALUES (11, ?)",
+            (package,),
+        )
+        conn.execute(
+            "INSERT INTO tool_rebuild_metadata "
+            "(environment_path, arguments_json, python_version, recorded_at) "
+            "VALUES (?, '[]', '3.11', '2024-01-01')",
+            (r"C:\USERS\ALICE\PROJ\.VENV",),
+        )
+        conn.execute(
+            "INSERT INTO cache_rebuild_failures "
+            "(environment_path, environment_type, command_json, last_error, last_failed_at) "
+            "VALUES (?, 'project', '[]', 'failed', '2024-01-01')",
+            (r"C:\USERS\ALICE\PROJ",),
+        )
+        conn.commit()
+
+        init_db(conn)
+
+        rows = conn.execute("SELECT id, path FROM venvs").fetchall()
+        assert [(row["id"], row["path"]) for row in rows] == [
+            (10, r"c:\users\alice\proj\.venv"),
+        ]
+        assert conn.execute(
+            "SELECT venv_id FROM venv_packages"
+        ).fetchone()[0] == 10
+        assert get_venv_by_path(conn, r"C:\USERS\ALICE\PROJ\.VENV")["id"] == 10
+        assert conn.execute(
+            "SELECT environment_path FROM tool_rebuild_metadata"
+        ).fetchone()[0] == r"c:\users\alice\proj\.venv"
+        assert conn.execute(
+            "SELECT environment_path FROM cache_rebuild_failures"
+        ).fetchone()[0] == r"c:\users\alice\proj"
+        assert conn.execute(
+            "SELECT value FROM _meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == "10"
+
+        from uv_mgr.sync import sync_venv
+        monkeypatch.setattr("uv_mgr.sync.os.path.isdir", lambda _path: True)
+        monkeypatch.setattr("uv_mgr.sync.venv_python_path", lambda _path: Path("python.exe"))
+        with patch("uv_mgr.sync.scan_venv_packages", return_value=([], True)):
+            assert sync_venv(conn, r"C:\USERS\ALICE\PROJ\.VENV", check_uv=False)
+        assert remove_venv(conn, r"C:\USERS\ALICE\PROJ\.VENV")
+        assert get_venv_by_path(conn, r"c:\users\alice\proj\.venv") is None
+        assert conn.execute("SELECT COUNT(*) FROM tool_rebuild_metadata").fetchone()[0] == 0
+
+    def test_migrate_v9_to_v10_keeps_posix_paths(self, conn, monkeypatch):
+        monkeypatch.setattr("uv_mgr.config.sys.platform", "linux")
+        conn.execute("UPDATE _meta SET value = '9' WHERE key = 'schema_version'")
+        conn.execute(
+            "INSERT INTO venvs (path, name, source, created_at) VALUES "
+            "('/Tmp/Mixed/.venv', 'project', 'auto', '2024-01-01')"
+        )
+        conn.commit()
+
+        init_db(conn)
+
+        assert conn.execute("SELECT path FROM venvs").fetchone()[0] == "/Tmp/Mixed/.venv"
 
 
 # ── #3~9 Venv CRUD ────────────────────────────────────────────────

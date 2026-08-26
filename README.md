@@ -150,7 +150,7 @@ uv-mgr db history --snapshots --venv /path/to/venv
 - **历史记录清理**：每次 venv 成功同步后，自动删除“未被引用但同名其他版本仍在使用”的数据库历史版本；完全没有版本被引用的包记录会保留给 GC 判断
 - **分离原则**：`index sync` 只更新索引，`index gc` 在同步时清理失效 venv 记录，只有 `gc` 才执行物理缓存删除——给用户反悔空间
 - **预览模式**：`--dry-run` 可查看影响范围后再执行
-- **旧版本重建**：首次执行 `uv-mgr gc --rebuild` 会处理同步历史中已不再被任何环境使用、但同名包仍有在用版本的旧版本。成功清理后会保存当时的版本基线；后续执行只处理相对上次重建新出现的未使用版本，不会反复清理同一批缓存。候选包名会被交给一次 `uv cache clean <包名1> <包名2> ...`，再在受影响项目的原目录执行 `uv-mgr sync`，从而使用该项目自己的锁文件和 Python 版本恢复缓存。通过 `uv-mgr tool install` 执行的常规 tool 安装会记录 requirements、可安全重放的选项及实际 Python 主次版本，重建时优先使用该记录；旧 tool 则回退读取 `uv-receipt.toml` 和索引的 Python 版本。私有索引、认证、路径约束等参数不会记录；无法安全重放或无法确定 Python 主次版本的 tool 会被跳过，相关缓存也会保留。恢复失败按环境记录，可用 `uv-mgr gc --rebuild --retry` 单独重试，不会再次清缓存。
+- **旧版本重建**：首次执行 `uv-mgr gc --rebuild` 会处理同步历史中已不再被任何环境使用、但同名包仍有在用版本的旧版本。成功清理后会保存当时的版本基线；后续执行只处理相对上次重建新出现的未使用版本，不会反复清理同一批缓存。候选包名会被交给一次 `uv cache clean <包名1> <包名2> ...`，再在受影响项目的原目录执行原生 `uv sync`，随后仅同步该项目的索引，从而使用该项目自己的锁文件和 Python 版本恢复缓存。失效 venv 会被跳过并保留索引记录，相关缓存也会保留。通过 `uv-mgr tool install` 执行的常规 tool 安装会记录 requirements、可安全重放的选项及实际 Python 主次版本，重建时优先使用该记录；旧 tool 则回退读取 `uv-receipt.toml` 和索引的 Python 版本。私有索引、认证、路径约束等参数不会记录；无法安全重放或无法确定 Python 主次版本的 tool 会被跳过，相关缓存也会保留。恢复失败按环境记录，可用 `uv-mgr gc --rebuild --retry` 单独重试，不会再次清缓存。
 
 数据库索引记录的是各 venv 的最终安装清单，不等同于 uv 的全量缓存。缓存中未被索引的构建依赖或下载包不会被自动判定为垃圾；数据库中没有对应缓存的历史记录也不会直接触发缓存删除。
 
@@ -170,7 +170,21 @@ uv-mgr/
 └── gc.py         # 垃圾回收
 ```
 
-数据库位置：`~/.local/share/uv-mgr/index.db`
+数据库位置会按运行平台自动选择：Linux 和其他 POSIX 系统默认是
+`$XDG_DATA_HOME/uv-mgr/index.db`（未设置时为 `~/.local/share/uv-mgr/index.db`）；
+Windows 默认是 `%LOCALAPPDATA%\\uv-mgr\\index.db`，没有该变量时依次使用
+`%APPDATA%` 与用户目录的 `AppData\\Local`。
+
+可通过下列环境变量调整，无需修改命令参数：
+
+- `UV_MGR_DB_PATH`：索引数据库完整路径，优先级最高。
+- `UV_MGR_DATA_DIR`：数据目录，默认数据库将创建为该目录中的 `index.db`。
+- `UV_MGR_UV_BIN`：指定 `uv` 或 `uv.exe` 的完整路径，适用于未加入 PATH 的安装。
+
+Windows 的 venv 解释器会自动使用 `Scripts\\python.exe`；POSIX 系统使用
+`bin/python`。所有路径输入都会转为绝对路径，Windows 上还会消除盘符和大小写
+差异，避免同一 venv 被重复登记。缓存清理和重建仍完全委托给检测到的 uv，
+uv-mgr 不直接处理硬链接、复制或权限。
 
 ## 自动发现与 uv 兼容性
 

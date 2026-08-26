@@ -3,25 +3,37 @@
 import os
 import re
 import sqlite3
+import ntpath
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+from uv_mgr.config import get_data_dir, get_db_path, is_windows, normalize_path
 
-DB_DIR = Path.home() / ".local" / "share" / "uv-mgr"
-DB_PATH = DB_DIR / "index.db"
+SCHEMA_VERSION = 10
+
+DB_DIR = get_data_dir()
+DB_PATH = get_db_path()
 
 
 def _ensure_dir() -> None:
-    DB_DIR.mkdir(parents=True, exist_ok=True)
+    # 以实际数据库文件的父目录为准，确保 UV_MGR_DB_PATH 与测试覆盖生效。
+    _current_db_path().parent.mkdir(parents=True, exist_ok=True)
+
+
+def _current_db_path() -> Path:
+    """读取运行时环境变量，同时保留 DB_PATH 的测试/嵌入覆盖能力。"""
+    if os.environ.get("UV_MGR_DB_PATH") or os.environ.get("UV_MGR_DATA_DIR"):
+        return get_db_path()
+    return DB_PATH
 
 
 def get_connection() -> sqlite3.Connection:
     _ensure_dir()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(_current_db_path()), timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
@@ -132,13 +144,16 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         ALTER TABLE venvs ADD COLUMN source TEXT NOT NULL DEFAULT 'user';
 
-        UPDATE venvs SET source = 'auto'
-        WHERE path LIKE '%/.venv'
-           OR path LIKE '%/.venv/%';
-
-        UPDATE venvs SET source = 'tool'
-        WHERE path LIKE '%/.local/share/uv/tools/%';
     """)
+    for row in conn.execute("SELECT id, path FROM venvs").fetchall():
+        path = row["path"]
+        portable = path.replace("\\", "/").lower()
+        source = "user"
+        if "/uv/tools/" in portable:
+            source = "tool"
+        elif portable.endswith("/.venv") or "/.venv/" in portable:
+            source = "auto"
+        conn.execute("UPDATE venvs SET source = ? WHERE id = ?", (source, row["id"]))
     conn.execute(
         "UPDATE _meta SET value = '2' WHERE key = 'schema_version'"
     )
@@ -267,6 +282,98 @@ def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
     print("数据库迁移: v8 → v9（已启用 uv tool 重建元数据）")
 
 
+def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+    """规范化 Windows venv 路径，并合并大小写造成的重复记录。"""
+    if is_windows():
+        rows = conn.execute(
+            "SELECT id, path FROM venvs ORDER BY id"
+        ).fetchall()
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            groups.setdefault(normalize_path(row["path"]), []).append(row)
+
+        for normalized, group in groups.items():
+            keeper = group[0]
+            keeper_id = keeper["id"]
+            duplicate_ids = [row["id"] for row in group[1:]]
+
+            # 先转移关联，避免删除重复 venv 时丢失其包清单。
+            for duplicate_id in duplicate_ids:
+                conn.execute(
+                    """INSERT OR IGNORE INTO venv_packages
+                       (venv_id, package_id, installed_at)
+                       SELECT ?, package_id, installed_at
+                       FROM venv_packages WHERE venv_id = ?""",
+                    (keeper_id, duplicate_id),
+                )
+
+            # 两张重建状态表均以路径为主键。冲突时保留主 venv 的状态；
+            # 主路径没有状态时，使用最早重复记录的状态补入。
+            old_paths = [row["path"] for row in group]
+            _migrate_environment_paths(
+                conn, "tool_rebuild_metadata", old_paths, normalized,
+            )
+            _migrate_environment_paths(
+                conn, "cache_rebuild_failures",
+                [ntpath.dirname(path) for path in old_paths],
+                ntpath.dirname(normalized), environment_type="project",
+            )
+            _migrate_environment_paths(
+                conn, "cache_rebuild_failures", old_paths, normalized,
+                environment_type="tool",
+            )
+
+            if duplicate_ids:
+                placeholders = ",".join("?" for _ in duplicate_ids)
+                conn.execute(
+                    f"DELETE FROM venvs WHERE id IN ({placeholders})", duplicate_ids,
+                )
+            conn.execute(
+                "UPDATE venvs SET path = ? WHERE id = ?", (normalized, keeper_id),
+            )
+
+    conn.execute("UPDATE _meta SET value = '10' WHERE key = 'schema_version'")
+    conn.commit()
+    print("数据库迁移: v9 → v10（已规范化 Windows venv 路径）")
+
+
+def _migrate_environment_paths(conn: sqlite3.Connection, table: str,
+                               old_paths: list[str], normalized: str,
+                               *, environment_type: str | None = None) -> None:
+    """将状态表中的一组旧路径合并为规范路径，保留最早记录。"""
+    type_sql = " AND environment_type = ?" if environment_type else ""
+    type_args = (environment_type,) if environment_type else ()
+    # 状态记录可能使用了与 venvs 不同大小写的路径；按 Windows 规范化值
+    # 补充候选，确保这些记录也能迁移。
+    candidates = list(old_paths)
+    for row in conn.execute(
+        f"SELECT environment_path FROM {table} WHERE 1=1{type_sql}", type_args
+    ).fetchall():
+        path = row[0]
+        if normalize_path(path) == normalized and path not in candidates:
+            candidates.append(path)
+    if conn.execute(
+        f"SELECT 1 FROM {table} WHERE environment_path = ?{type_sql}",
+        (normalized, *type_args),
+    ).fetchone() is None:
+        for old_path in candidates:
+            if old_path == normalized:
+                continue
+            changed = conn.execute(
+                f"UPDATE OR IGNORE {table} SET environment_path = ? "
+                f"WHERE environment_path = ?{type_sql}",
+                (normalized, old_path, *type_args),
+            ).rowcount
+            if changed:
+                break
+    for old_path in candidates:
+        if old_path != normalized:
+            conn.execute(
+                f"DELETE FROM {table} WHERE environment_path = ?{type_sql}",
+                (old_path, *type_args),
+            )
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     cur = conn.execute("SELECT value FROM _meta WHERE key = 'schema_version'")
@@ -301,6 +408,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             version = 8
         if version < 9:
             _migrate_v8_to_v9(conn)
+            version = 9
+        if version < 10:
+            _migrate_v9_to_v10(conn)
         elif version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"数据库 schema 版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}，"
@@ -312,6 +422,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 # ── Venv CRUD ───────────────────────────────────────────────────────
 
 def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
+    path = normalize_path(path)
     now = datetime.now(timezone.utc).isoformat()
     name = os.path.basename(os.path.normpath(path))
     existing = get_venv_by_path(conn, path)
@@ -331,6 +442,7 @@ def add_venv(conn: sqlite3.Connection, path: str, source: str = 'user') -> int:
 
 
 def remove_venv(conn: sqlite3.Connection, path: str) -> bool:
+    path = normalize_path(path)
     conn.execute("DELETE FROM tool_rebuild_metadata WHERE environment_path = ?", (path,))
     cur = conn.execute("DELETE FROM venvs WHERE path = ?", (path,))
     conn.commit()
@@ -353,6 +465,7 @@ def get_venvs_by_source(conn: sqlite3.Connection, source: str) -> list[sqlite3.R
 
 
 def get_venv_by_path(conn: sqlite3.Connection, path: str):
+    path = normalize_path(path)
     return conn.execute(
         "SELECT * FROM venvs WHERE path = ?", (path,)
     ).fetchone()
@@ -685,7 +798,7 @@ def record_tool_rebuild_metadata(conn: sqlite3.Connection, environment_path: str
              arguments_json = excluded.arguments_json,
              python_version = excluded.python_version,
              recorded_at = excluded.recorded_at""",
-        (environment_path, arguments_json, python_version, _now()),
+        (normalize_path(environment_path), arguments_json, python_version, _now()),
     )
     conn.commit()
 
@@ -694,7 +807,7 @@ def get_tool_rebuild_metadata(conn: sqlite3.Connection, environment_path: str):
     """取得指定 tool 环境的安全重放元数据。"""
     return conn.execute(
         "SELECT * FROM tool_rebuild_metadata WHERE environment_path = ?",
-        (environment_path,),
+        (normalize_path(environment_path),),
     ).fetchone()
 
 
@@ -712,7 +825,7 @@ def record_rebuild_failure(conn: sqlite3.Connection, environment_path: str,
              attempts = attempts + 1,
              last_error = excluded.last_error,
              last_failed_at = excluded.last_failed_at""",
-        (environment_path, environment_type, command_json, error, _now()),
+        (normalize_path(environment_path), environment_type, command_json, error, _now()),
     )
     conn.commit()
 
@@ -720,7 +833,7 @@ def record_rebuild_failure(conn: sqlite3.Connection, environment_path: str,
 def clear_rebuild_failure(conn: sqlite3.Connection, environment_path: str) -> None:
     conn.execute(
         "DELETE FROM cache_rebuild_failures WHERE environment_path = ?",
-        (environment_path,),
+        (normalize_path(environment_path),),
     )
     conn.commit()
 

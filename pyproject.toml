@@ -16,6 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
     "Topic :: System :: Archiving :: Packaging",
 ]
 dependencies = []
@@ -42,3 +43,6 @@ include = ["uv_mgr*"]
 
 [tool.uv]
 package = true
+constraint-dependencies = [
+    "packaging==26.3",
+]

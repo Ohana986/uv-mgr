@@ -50,12 +50,13 @@ class TestGc:
         record_sync_history(conn, str(venv_path), "3.11", [("first", "1.0"), ("second", "2.0")])
         record_sync_history(conn, str(venv_path), "3.11", [("first", "2.0"), ("second", "3.0")])
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
+        monkeypatch.setattr("uv_mgr.gc.sync_venv", lambda *args, **kwargs: True)
         with patch("uv_mgr.gc.check_uv_version", return_value=(True, "1.0")), \
              patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
             assert gc(auto_sync=False, rebuild=True) == 0
         commands = [call.args[0] for call in run.call_args_list]
         assert ["uv", "cache", "clean", "first", "second"] in commands
-        sync_call = next(call for call in run.call_args_list if call.args[0] == ["uv-mgr", "sync"])
+        sync_call = next(call for call in run.call_args_list if call.args[0] == ["uv", "sync"])
         assert sync_call.kwargs == {"cwd": str(project), "timeout": 900}
 
     def test_rebuild_failure_is_retried_without_cleaning(self, conn, db_path, tmp_path, monkeypatch):
@@ -71,6 +72,7 @@ class TestGc:
         record_sync_history(conn, str(venv_path), "3.11", [("retry-pkg", "1.0")])
         record_sync_history(conn, str(venv_path), "3.11", [("retry-pkg", "2.0")])
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
+        monkeypatch.setattr("uv_mgr.gc.sync_venv", lambda *args, **kwargs: True)
         with patch("uv_mgr.gc.check_uv_version", return_value=(True, "1.0")), \
              patch("subprocess.run", side_effect=[
                  MagicMock(returncode=0, stderr=""), MagicMock(returncode=1, stdout="", stderr="failed"),
@@ -83,7 +85,7 @@ class TestGc:
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: reopened)
         with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
             assert gc(auto_sync=False, rebuild=True, retry=True) == 0
-        run.assert_called_once_with(["uv-mgr", "sync"], cwd=str(project), capture_output=True, text=True, timeout=900)
+        run.assert_called_once_with(["uv", "sync"], cwd=str(project), capture_output=True, text=True, timeout=900)
         final = sqlite3.connect(str(db_path))
         final.row_factory = sqlite3.Row
         assert get_rebuild_failures(final) == []
@@ -103,6 +105,7 @@ class TestGc:
         record_sync_history(conn, str(venv_path), "3.11", [("failed-pkg", "1.0")])
         record_sync_history(conn, str(venv_path), "3.11", [("failed-pkg", "2.0")])
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
+        monkeypatch.setattr("uv_mgr.gc.sync_venv", lambda *args, **kwargs: True)
         with patch("uv_mgr.gc.check_uv_version", return_value=(True, "1.0")), \
              patch("subprocess.run", side_effect=[
                  MagicMock(returncode=0, stderr=""), MagicMock(returncode=1),
@@ -115,6 +118,37 @@ class TestGc:
         reopened.row_factory = sqlite3.Row
         assert "详见上方 uv 输出" in get_rebuild_failures(reopened)[0]["last_error"]
         reopened.close()
+
+    def test_rebuild_skips_missing_venv_and_restores_others(self, conn, tmp_path, monkeypatch, capsys):
+        """重建跳过失效环境，不阻断存在项目的恢复。"""
+        from uv_mgr.db import add_venv, ensure_package, record_sync_history, replace_venv_packages
+
+        project = tmp_path / "project"
+        venv_path = project / ".venv"
+        venv_path.mkdir(parents=True)
+        (project / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0'\n")
+        active = add_venv(conn, str(venv_path), source="auto")
+        missing = add_venv(conn, str(tmp_path / "missing" / ".venv"), source="auto")
+        package = ensure_package(conn, "rebuild-pkg", "2.0")
+        missing_package = ensure_package(conn, "missing-pkg", "2.0")
+        replace_venv_packages(conn, active, [package])
+        replace_venv_packages(conn, missing, [missing_package])
+        record_sync_history(conn, str(venv_path), "3.11", [("rebuild-pkg", "1.0")])
+        record_sync_history(conn, str(venv_path), "3.11", [("rebuild-pkg", "2.0")])
+        monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)
+        monkeypatch.setattr("uv_mgr.gc.sync_all", lambda *args, **kwargs: True)
+        monkeypatch.setattr("uv_mgr.gc.sync_venv", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            "uv_mgr.gc.get_new_rebuild_packages",
+            lambda _conn: [
+                {"name": "rebuild-pkg", "version": "1.0"},
+                {"name": "missing-pkg", "version": "1.0"},
+            ],
+        )
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
+            assert gc(rebuild=True) == 0
+        assert ["uv", "sync"] in [call.args[0] for call in run.call_args_list]
+        assert "跳过" in capsys.readouterr().out
 
     def test_dry_run_does_not_execute_commands(self, conn, monkeypatch):
         monkeypatch.setattr("uv_mgr.gc.get_connection", lambda: conn)

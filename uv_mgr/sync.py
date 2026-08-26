@@ -7,6 +7,14 @@ import sys
 import re
 from pathlib import Path
 
+from uv_mgr.config import (
+    get_uv_command,
+    normalize_path,
+    resolve_uv_command,
+    subprocess_text_kwargs,
+    venv_python_candidates,
+)
+
 from uv_mgr.db import (
     get_connection,
     init_db,
@@ -49,7 +57,8 @@ def check_uv_version() -> tuple[bool, str]:
     """检查 uv 是否存在且满足最低版本要求。"""
     try:
         result = subprocess.run(
-            ["uv", "--version"], capture_output=True, text=True, timeout=10
+            [get_uv_command(), "--version"], capture_output=True, text=True,
+            timeout=10, **subprocess_text_kwargs()
         )
     except FileNotFoundError:
         return False, "找不到 uv 命令，请先安装 uv"
@@ -68,9 +77,7 @@ def check_uv_version() -> tuple[bool, str]:
 
 def venv_python_path(venv_path: str) -> Path | None:
     """返回不同平台常见的 venv Python 解释器路径。"""
-    root = Path(venv_path)
-    for candidate in (root / "bin" / "python", root / "Scripts" / "python.exe",
-                      root / "Scripts" / "python"):
+    for candidate in venv_python_candidates(venv_path):
         if candidate.exists():
             return candidate
     return None
@@ -89,8 +96,8 @@ def discover_tool_venvs() -> list[str]:
     """运行 uv tool dir 获取所有工具 venv 路径。"""
     try:
         result = subprocess.run(
-            ["uv", "tool", "dir"],
-            capture_output=True, text=True, timeout=10,
+            [get_uv_command(), "tool", "dir"], capture_output=True, text=True,
+            timeout=10, **subprocess_text_kwargs(),
         )
         if result.returncode != 0:
             return []
@@ -98,7 +105,7 @@ def discover_tool_venvs() -> list[str]:
         if not tool_dir.is_dir():
             return []
         return sorted(
-            str(p.resolve())
+            normalize_path(p)
             for p in tool_dir.iterdir()
             if p.is_dir() and not p.name.startswith(".")
         )
@@ -115,9 +122,9 @@ def scan_venv_packages(venv_python: str, *, check_uv: bool = True) -> tuple[list
             return [], False
     try:
         result = subprocess.run(
-            ["uv", "pip", "list", "--python", venv_python,
+            [get_uv_command(), "pip", "list", "--python", venv_python,
              "--format=json", "--quiet"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, **subprocess_text_kwargs(),
         )
         if result.returncode != 0:
             print(f"警告: 扫描 {venv_python} 失败:\n{result.stderr}",
@@ -140,6 +147,7 @@ def sync_venv(conn, venv_path: str, *,
               source: str = 'auto', verbose: bool = False,
               check_uv: bool = True) -> bool:
     """同步单个 venv 的包状态到数据库，返回是否成功。"""
+    venv_path = normalize_path(venv_path)
     venv = get_venv_by_path(conn, venv_path)
 
     # 自动注册
@@ -163,6 +171,9 @@ def sync_venv(conn, venv_path: str, *,
         if prune:
             remove_venv(conn, venv_path)
             print(f"已清理失效记录: {venv_path}")
+            # ``index gc`` 的目标正是清理失效记录；记录删除后将其视为
+            # 已成功处理，避免其阻断其余环境的索引维护。
+            return True
         else:
             print("提示: 使用 --prune 自动清理失效记录", file=sys.stderr)
         record_operation(conn, "sync", success=False, venv_path=venv_path,
@@ -172,7 +183,7 @@ def sync_venv(conn, venv_path: str, *,
     # 找 python 解释器
     python_path = venv_python_path(venv_path)
     if python_path is None:
-        print(f"警告: 未找到 Python 解释器: {venv_path}/bin/python（Windows 可使用 Scripts/python.exe）", file=sys.stderr)
+        print(f"警告: 未找到 Python 解释器: {venv_path}（POSIX: bin/python；Windows: Scripts/python.exe）", file=sys.stderr)
         record_operation(conn, "sync", success=False, venv_path=venv_path,
                          error="未找到 Python 解释器")
         return False
@@ -181,8 +192,8 @@ def sync_venv(conn, venv_path: str, *,
     python_version = None
     try:
         ver_res = subprocess.run(
-            [str(python_path), "--version"],
-            capture_output=True, text=True, timeout=10
+            [str(python_path), "--version"], capture_output=True, text=True,
+            timeout=10, **subprocess_text_kwargs()
         )
         if ver_res.returncode == 0:
             # Output is like "Python 3.11.15" or on stderr
@@ -230,7 +241,7 @@ def sync_venv(conn, venv_path: str, *,
 
 
 def sync_all(conn, *, auto_discover: bool = True, prune: bool = False,
-             verbose: bool = False) -> bool:
+             verbose: bool = False, ignore_missing: bool = False) -> bool:
     """同步所有已注册 venv，返回是否所有环境均同步成功。"""
     venvs = list_venvs(conn)
     if not venvs and not auto_discover:
@@ -245,17 +256,24 @@ def sync_all(conn, *, auto_discover: bool = True, prune: bool = False,
     # 自动发现：扫描常见位置
     discovered = set()
     if auto_discover:
-        cwd = Path.cwd()
+        try:
+            cwd = Path.cwd()
+        except FileNotFoundError:
+            # 终端可能仍位于刚被删除的目录。此时跳过基于 cwd 的发现，
+            # 但不能阻断已登记环境和 uv tool 的同步。
+            print("警告: 当前工作目录已不存在，跳过当前目录 venv 自动发现", file=sys.stderr)
+            cwd = None
         # 当前目录的 .venv
-        local_venv = cwd / ".venv"
-        if local_venv.is_dir():
-            discovered.add(str(local_venv.resolve()))
-        # 父目录链中的 .venv
-        for parent in cwd.parents:
-            p = parent / ".venv"
-            if p.is_dir():
-                discovered.add(str(p.resolve()))
-                break  # 只找最近的祖先
+        if cwd is not None:
+            local_venv = cwd / ".venv"
+            if local_venv.is_dir():
+                discovered.add(normalize_path(local_venv))
+            # 父目录链中的 .venv
+            for parent in cwd.parents:
+                p = parent / ".venv"
+                if p.is_dir():
+                    discovered.add(normalize_path(p))
+                    break  # 只找最近的祖先
 
     known_paths = {v["path"] for v in venvs}
 
@@ -280,7 +298,10 @@ def sync_all(conn, *, auto_discover: bool = True, prune: bool = False,
     for v in list_venvs(conn):
         if not sync_venv(conn, v["path"], auto_register=False, prune=prune,
                          verbose=verbose, check_uv=False):
-            all_success = False
+            if ignore_missing and not os.path.isdir(v["path"]):
+                print(f"跳过失效 venv: {v['path']}")
+            else:
+                all_success = False
     return all_success
 
 
@@ -290,12 +311,12 @@ def run_uv_passthrough(args: list[str]) -> int:
     if not ok:
         print(f"错误: {message}", file=sys.stderr)
         return 1
-    cmd = ["uv"] + args
+    cmd = resolve_uv_command(["uv", *args])
     try:
         proc = subprocess.run(cmd)
         return proc.returncode
     except FileNotFoundError:
-        print("错误: 找不到 uv 命令，请确保已安装 (dnf install uv)", file=sys.stderr)
+        print("错误: 找不到 uv 命令，请安装 uv 或设置 UV_MGR_UV_BIN。", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130
