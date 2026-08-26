@@ -194,5 +194,6 @@ uv-mgr 不直接处理硬链接、复制或权限。
 
 ## 发布验证
 
-发布前应在 Python 3.10 至 3.13 上运行完整测试，并构建源码包和 wheel。发行物安装后应验证
+发布前应在 Python 3.10 至 3.13 上运行完整测试，并使用项目开发环境构建源码包和 wheel：
+`uv run python -m build --sdist --wheel`，再用 `uv run python -m twine check dist/*` 校验。发行物安装后应验证
 `uv-mgr --version`、`python -m uv_mgr --version` 以及非零退出码是否正确传递。本项目不在 CI 中自动上传 PyPI。

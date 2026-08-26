@@ -29,7 +29,11 @@ Repository = "https://github.com/xr-w/uv-mgr"
 uv-mgr = "uv_mgr.cli:main"
 
 [dependency-groups]
-dev = ["build>=1.2", "pytest>=9.1.1"]
+dev = [
+    "build>=1.2",
+    "pytest>=9.1.1",
+    "twine>=5.1",
+]
 
 [build-system]
 requires = ["setuptools>=75"]

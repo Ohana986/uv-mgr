@@ -13,7 +13,8 @@
 
 ```bash
 uv-mgr sync
-python -m build --sdist --wheel
+uv run python -m build --sdist --wheel
+uv run python -m twine check dist/*
 ```
 
-如果项目根目录存在旧的 `build/` 构建残留目录，请先手动删除该目录，再运行构建命令；否则它可能遮蔽 Python 的 `build` 构建工具包。
+构建和校验命令使用 `uv run`，确保调用项目开发依赖中的工具，而不是系统 Python。若项目根目录存在旧的 `build/` 构建残留目录，请先手动删除该目录，再运行构建命令；否则它可能遮蔽 Python 的 `build` 构建工具包。
