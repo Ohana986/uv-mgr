@@ -24,8 +24,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/xr-w/uv-mgr"
-Repository = "https://github.com/xr-w/uv-mgr"
+Homepage = "https://github.com/Ohana986/uv-mgr"
+Repository = "https://github.com/Ohana986/uv-mgr"
 
 [project.scripts]
 uv-mgr = "uv_mgr.cli:main"
