@@ -28,6 +28,7 @@ from uv_mgr.db import (
     get_package_events,
     get_snapshots,
     get_snapshot_packages,
+    prune_rebuild_failures,
 )
 from uv_mgr.config import normalize_path
 
@@ -271,6 +272,32 @@ class TestVenvCrud:
         assert ids == [v1, v2, v3]  # created_at 递增
 
 
+class TestRebuildFailurePruning:
+    def test_windows_project_failure_uses_windows_path_separator(self, conn, monkeypatch):
+        monkeypatch.setattr("uv_mgr.config.sys.platform", "win32")
+        add_venv(conn, r"C:\Users\Alice\Project\.venv", source="auto")
+        conn.executemany(
+            """INSERT INTO cache_rebuild_failures
+               (environment_path, environment_type, command_json, last_error, last_failed_at)
+               VALUES (?, 'project', '[]', 'failed', '2024-01-01')""",
+            [
+                (r"C:\Users\Alice\Project",),
+                (r"C:\Users\Alice\Removed",),
+            ],
+        )
+        conn.commit()
+
+        prune_rebuild_failures(conn)
+
+        remaining = [
+            row["environment_path"]
+            for row in conn.execute(
+                "SELECT environment_path FROM cache_rebuild_failures"
+            )
+        ]
+        assert remaining == [r"C:\Users\Alice\Project"]
+
+
 # ── #10~13 Package CRUD ────────────────────────────────────────────
 
 class TestPackageCrud:
@@ -376,7 +403,7 @@ class TestHistory:
         v = add_venv(conn, path)
         record_sync_history(conn, path, None, [("foo", "1.0")])
         remove_venv(conn, path)
-        assert get_snapshots(conn, venv_path=path)[0]["venv_path"] == path
+        assert get_snapshots(conn, venv_path=path)[0]["venv_path"] == normalize_path(path)
         assert v > 0
 
 

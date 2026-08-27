@@ -875,16 +875,30 @@ def get_rebuild_failures(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def prune_rebuild_failures(conn: sqlite3.Connection) -> None:
     """删除不再对应已索引环境的缓存恢复失败记录。"""
-    conn.execute(
-        """DELETE FROM cache_rebuild_failures AS failure
-           WHERE NOT EXISTS (
-               SELECT 1 FROM venvs v
-               WHERE (failure.environment_type = 'project'
-                      AND v.path = failure.environment_path || '/.venv')
-                  OR (failure.environment_type = 'tool'
-                      AND v.path = failure.environment_path)
-           )"""
-    )
+    valid_environments: set[tuple[str, str]] = set()
+    for venv in list_venvs(conn):
+        venv_path = venv["path"]
+        if venv["source"] == "tool":
+            valid_environments.add(("tool", venv_path))
+        elif is_windows():
+            if ntpath.basename(venv_path) == ".venv":
+                valid_environments.add(("project", ntpath.dirname(venv_path)))
+        elif Path(venv_path).name == ".venv":
+            valid_environments.add(("project", str(Path(venv_path).parent)))
+
+    stale_paths = [
+        row["environment_path"]
+        for row in conn.execute(
+            "SELECT environment_path, environment_type FROM cache_rebuild_failures"
+        )
+        if (row["environment_type"], normalize_path(row["environment_path"]))
+        not in valid_environments
+    ]
+    if stale_paths:
+        conn.executemany(
+            "DELETE FROM cache_rebuild_failures WHERE environment_path = ?",
+            [(path,) for path in stale_paths],
+        )
     conn.commit()
 
 

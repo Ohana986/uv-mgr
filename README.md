@@ -37,13 +37,16 @@ python -m uv_mgr <command>
 uv-mgr sync                 # uv sync：同步项目环境
 uv-mgr add requests         # 透传 uv add：添加依赖
 uv-mgr remove requests      # 透传 uv remove：删除依赖
-uv-mgr venv --python 3.11   # uv venv：创建虚拟环境（自动注册到索引）
+uv-mgr venv --python 3.11   # uv venv：创建当前项目的 .venv（自动发现并注册）
 uv-mgr run app.py           # uv run：运行脚本
 uv-mgr pip list             # uv pip list：查看已安装包
 ```
 
 透传 uv 执行成功后，会自动触发一次 `uv-mgr index sync` 更新索引。`add`、`remove`、`list` 等未出现在
 `index` 后的命令都是 uv 命令透传；索引管理命令必须使用 `uv-mgr index <subcommand>`。
+
+自动发现只会注册当前目录或最近祖先目录中的 `.venv`。通过 `uv-mgr venv <其他路径>` 创建的命名环境，
+请使用 `uv-mgr index add <路径>` 手动登记。
 
 ### 索引管理（`uv-mgr index <subcommand>`）
 
